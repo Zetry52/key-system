@@ -1,0 +1,363 @@
+{
+  "licenses": [
+    {
+      "license_key": "lycyf",
+      "name": "support",
+      "product": "Private cheat",
+      "expires_at": "2028-11-28T14:19:25Z",
+      "status": "active",
+      "hwid": "",
+      "notes": "",
+      "created_at": "2026-03-04T14:19:25Z",
+      "last_seen_at": "",
+      "max_users": 1
+    },
+    {
+      "license_key": "xuronix",
+      "name": "brather",
+      "product": "Private cheat",
+      "expires_at": "2028-11-28T14:34:20Z",
+      "status": "active",
+      "hwid": "",
+      "notes": "my love",
+      "created_at": "2026-03-04T14:34:20Z",
+      "last_seen_at": "",
+      "max_users": 1
+    },
+    {
+      "license_key": "vidoddogo",
+      "name": "co-owner",
+      "product": "Private cheat",
+      "expires_at": "2028-11-28T15:50:05Z",
+      "status": "active",
+      "hwid": "",
+      "notes": "pidor",
+      "created_at": "2026-03-04T15:50:05Z",
+      "last_seen_at": "",
+      "max_users": 1
+    },
+    {
+      "license_key": "Zetry",
+      "name": "Owner",
+      "product": "Private cheat",
+      "expires_at": "2028-11-28T16:00:39Z",
+      "status": "active",
+      "hwid": "D87C8DC3",
+      "notes": "Owner key",
+      "created_at": "2026-03-04T16:00:39Z",
+      "last_seen_at": "2026-03-05T10:37:11Z",
+      "max_users": 1,
+      "last_ip": "127.0.0.1"
+    },
+    {
+      "license_key": "vladpukaet332",
+      "name": "user",
+      "product": "Private cheat",
+      "expires_at": "2026-12-29T16:12:31Z",
+      "status": "active",
+      "hwid": "",
+      "notes": "",
+      "created_at": "2026-03-04T16:12:31Z",
+      "last_seen_at": "",
+      "max_users": 1
+    },
+    {
+      "license_key": "Maksimkakiber219",
+      "name": "User",
+      "product": "Private cheat",
+      "expires_at": "2026-12-29T16:16:17Z",
+      "status": "active",
+      "hwid": "",
+      "notes": "",
+      "created_at": "2026-03-04T16:16:17Z",
+      "last_seen_at": "",
+      "max_users": 1
+    }
+  ],
+  "sessions": {
+    "2836c92344cbb58fd53cf07ec684886c84b7fb055a3e05b9": "2026-03-05T00:42:30Z",
+    "cf3606d23b784c99a20acb33b7bcc89b623846956633aa50": "2026-03-05T22:32:13Z",
+    "2dec22a7fd7d82589b1c077a1a8e784ff3a0ec0c53fc2838": "2026-03-05T22:55:24Z"
+  },
+  "auth_logs": [
+    {
+      "timestamp": "2026-03-04T12:51:52Z",
+      "license_key": "zetry",
+      "product": "loader",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License not found"
+    },
+    {
+      "timestamp": "2026-03-04T12:52:15Z",
+      "license_key": "owner",
+      "product": "loader",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "Wrong product"
+    },
+    {
+      "timestamp": "2026-03-04T12:54:17Z",
+      "license_key": "owner",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-04T12:54:37Z",
+      "license_key": "owner",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-04T12:54:57Z",
+      "license_key": "owner",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-04T12:55:12Z",
+      "license_key": "owner",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License frozen"
+    },
+    {
+      "timestamp": "2026-03-04T12:55:17Z",
+      "license_key": "owner",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License frozen"
+    },
+    {
+      "timestamp": "2026-03-04T12:55:28Z",
+      "license_key": "zetry",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License not found"
+    },
+    {
+      "timestamp": "2026-03-04T12:55:35Z",
+      "license_key": "owner",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-04T12:55:46Z",
+      "license_key": "owner",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License not found"
+    },
+    {
+      "timestamp": "2026-03-04T12:55:54Z",
+      "license_key": "apex",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License not found"
+    },
+    {
+      "timestamp": "2026-03-04T12:57:11Z",
+      "license_key": "zetry",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-04T12:57:39Z",
+      "license_key": "zetry",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License frozen"
+    },
+    {
+      "timestamp": "2026-03-04T12:57:45Z",
+      "license_key": "zetry",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License frozen"
+    },
+    {
+      "timestamp": "2026-03-04T14:01:19Z",
+      "license_key": "pizda",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License frozen"
+    },
+    {
+      "timestamp": "2026-03-04T14:01:29Z",
+      "license_key": "botyara",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-04T14:02:12Z",
+      "license_key": "botyara",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-04T14:02:37Z",
+      "license_key": "botyara",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License frozen"
+    },
+    {
+      "timestamp": "2026-03-04T14:03:50Z",
+      "license_key": "Zetry",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "Wrong product"
+    },
+    {
+      "timestamp": "2026-03-04T14:05:10Z",
+      "license_key": "Zetry",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-04T14:05:34Z",
+      "license_key": "Zetry",
+      "product": "private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-04T14:20:23Z",
+      "license_key": "Zetry",
+      "product": "Private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-04T14:20:36Z",
+      "license_key": "Zetry",
+      "product": "Private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-04T14:20:56Z",
+      "license_key": "Zetry",
+      "product": "Private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-04T14:21:16Z",
+      "license_key": "Zetry",
+      "product": "Private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-04T14:39:36Z",
+      "license_key": "Zetry",
+      "product": "Private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License not found"
+    },
+    {
+      "timestamp": "2026-03-04T14:39:47Z",
+      "license_key": "zetry",
+      "product": "Private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-05T10:36:59Z",
+      "license_key": "grnfghtjn",
+      "product": "Private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License not found"
+    },
+    {
+      "timestamp": "2026-03-05T10:37:05Z",
+      "license_key": "zetry",
+      "product": "Private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License not found"
+    },
+    {
+      "timestamp": "2026-03-05T10:37:11Z",
+      "license_key": "Zetry",
+      "product": "Private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": true,
+      "message": "License valid"
+    },
+    {
+      "timestamp": "2026-03-05T10:55:40Z",
+      "license_key": "\u043b\u0449\u043c\u043c\u0444\u043b\u0438",
+      "product": "Private cheat",
+      "hwid": "D87C8DC3",
+      "ip": "127.0.0.1",
+      "success": false,
+      "message": "License not found"
+    }
+  ]
+}
