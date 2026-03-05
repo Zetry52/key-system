@@ -1,6 +1,7 @@
 import argparse
 import html
 import json
+import os
 import secrets
 import threading
 import time
@@ -1669,7 +1670,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve = sub.add_parser("serve")
     serve.add_argument("--host", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=8080)
+    serve.add_argument("--port", type=int, default=int(os.environ.get("PORT", "10000")))
     serve.add_argument("--with-telegram", action="store_true")
     serve.set_defaults(func=command_serve)
 
