@@ -1669,7 +1669,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve = sub.add_parser("serve")
-    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--host", default="0.0.0.0")
     serve.add_argument("--port", type=int, default=int(os.environ.get("PORT", "10000")))
     serve.add_argument("--with-telegram", action="store_true")
     serve.set_defaults(func=command_serve)
