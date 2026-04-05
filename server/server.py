@@ -3814,7 +3814,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
         parsed = parse_qs(body, keep_blank_values=True)
         return {key: values[0] for key, values in parsed.items()}
 
->>>>>>> b6fc491 (update key system)
     def _get_session_token(self) -> str:
         cookie_header = self.headers.get("Cookie", "")
         if not cookie_header:
@@ -3867,7 +3866,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
         except Exception:
             return False
         return self._admin_lock_matches(db)
-<<<<<<< HEAD
 
     def _require_auth(self) -> bool:
         if self._is_authenticated():
@@ -3884,7 +3882,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", set_cookie)
         self.end_headers()
 
-=======
 
     def _require_auth(self) -> bool:
         if self._is_authenticated():
@@ -3901,7 +3898,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
             self.send_header("Set-Cookie", set_cookie)
         self.end_headers()
 
->>>>>>> b6fc491 (update key system)
     def _render_login(self, error: str = "") -> None:
         error_html = f'<div class="flash">{html.escape(error)}</div>' if error else ""
         db = load_db()
@@ -3909,7 +3905,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
         products = len({str(item.get("product", "")).strip() for item in db.get("licenses", []) if str(item.get("product", "")).strip()})
         bound_keys = sum(1 for item in db.get("licenses", []) if item.get("hwid"))
         body = f"""
-<<<<<<< HEAD
 <div class="login card">
   <h1>Key MatrixHub</h1>
   <p class="muted">Admin authorization</p>
@@ -3989,7 +3984,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
   </td>
 </tr>""")
 
-=======
 <div class="login-shell">
   <div class="login-layout">
     <section class="login-panel card">
@@ -4099,7 +4093,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
   <div class="license-key">No keys found</div>
   <div class="license-caption">Try a different search or create a new license in the panel on the right.</div>
 </article>"""
->>>>>>> b6fc491 (update key system)
         flash_html = f'<div class="flash">{html.escape(flash)}</div>' if flash else ""
         body = f"""
 <div class="app">
@@ -4107,7 +4100,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
     <div class="brand">
       <div class="logo"></div>
       <div>
-<<<<<<< HEAD
         <h1>Key MatrixHub</h1>
         <p>Authentication Panel</p>
       </div>
@@ -4122,7 +4114,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
     <div class="footer" style="margin-top:16px;">
       API: <span class="code">/api/validate</span><br>
       Admin: <span class="code">/admin</span>
-=======
         <h1>Key System</h1>
         <p>Admin workspace</p>
       </div>
@@ -4139,13 +4130,11 @@ class LicenseHandler(BaseHTTPRequestHandler):
       <span class="code">/api/validate</span><br><br>
       Key DB<br>
       <span class="code">server/licenses.json</span>
->>>>>>> b6fc491 (update key system)
     </div>
   </aside>
   <main class="content">
     <div class="topbar">
       <div class="title">
-<<<<<<< HEAD
         <h2>ADMIN DASHBOARD</h2>
         <div class="muted">Key MatrixHub control center</div>
       </div>
@@ -4221,7 +4210,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
           {self._render_logs_html(db)}
         </div>
       </div>
-=======
         <h2>Admin Dashboard</h2>
         <div class="muted">Refreshed visuals, live key vault cards and autosaved local database.</div>
       </div>
@@ -4383,12 +4371,10 @@ class LicenseHandler(BaseHTTPRequestHandler):
           </div>
         </section>
       </div>
->>>>>>> b6fc491 (update key system)
     </div>
   </main>
 </div>
 """
-<<<<<<< HEAD
         self._send_bytes(200, html_page("Key MatrixHub Admin", body), "text/html; charset=utf-8")
 
     def _render_logs_html(self, db: dict) -> str:
@@ -4452,7 +4438,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
             self._send_json(200 if result.get("success") else 403, result)
             return
 
-=======
         self._send_bytes(200, html_page("Key System Admin", body), "text/html; charset=utf-8")
 
     def _render_logs_html(self, db: dict) -> str:
@@ -4504,7 +4489,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
             self._send_json(200 if result.get("success") else 403, result)
             return
 
->>>>>>> b6fc491 (update key system)
         if self.path == "/admin/login":
             form = self._read_form()
             config = ensure_config()
@@ -4537,7 +4521,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
             save_db(db)
             self._redirect("/admin", f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax")
             return
-<<<<<<< HEAD
 
         if self.path == "/admin/logout":
             db = load_db()
@@ -4832,7 +4815,6 @@ if __name__ == "__main__":
 
 
 
-=======
 
         if self.path == "/admin/logout":
             db = load_db()
@@ -5144,4 +5126,3 @@ if __name__ == "__main__":
 
 
 
->>>>>>> b6fc491 (update key system)
