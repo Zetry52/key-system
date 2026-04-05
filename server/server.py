@@ -1,5 +1,4 @@
-<<<<<<< HEAD
-﻿import argparse
+import argparse
 import hashlib
 import html
 import json
