@@ -75,10 +75,15 @@
     }
   ],
   "sessions": {
-    "d7da30cabfc142fa7d1f54f5019e214938491e9901ebdc44": {
-      "expires_at": "2026-03-28T22:42:16Z",
+    "a7b82c8d2f050e8c71cf9c7194b8b9950acd380048f5d621": {
+      "expires_at": "2026-03-28T07:50:57Z",
       "ip": "127.0.0.1",
-      "agent_fp": "c335f1a9d2fdddd2112124f7af5a0e5e"
+      "agent_fp": "31b61a1517a6fcd0ef7b42f52f05ea2d"
+    },
+    "45fcb9def558efc9a411b08bfc106debff3942e24e4e6975": {
+      "expires_at": "2026-03-28T22:41:56Z",
+      "ip": "127.0.0.1",
+      "agent_fp": "31b61a1517a6fcd0ef7b42f52f05ea2d"
     }
   },
   "auth_logs": [
@@ -364,7 +369,7 @@
   ],
   "admin_device_lock": {
     "ip": "127.0.0.1",
-    "agent_fp": "c335f1a9d2fdddd2112124f7af5a0e5e",
-    "locked_at": "2026-03-28T10:42:16Z"
+    "agent_fp": "31b61a1517a6fcd0ef7b42f52f05ea2d",
+    "locked_at": "2026-03-27T19:50:57Z"
   }
 }

@@ -66,7 +66,7 @@
       "name": "User",
       "product": "Private cheat",
       "expires_at": "2026-12-29T16:16:17Z",
-      "status": "active",
+      "status": "frozen",
       "hwid": "",
       "notes": "",
       "created_at": "2026-03-04T16:16:17Z",
@@ -75,10 +75,10 @@
     }
   ],
   "sessions": {
-    "d7da30cabfc142fa7d1f54f5019e214938491e9901ebdc44": {
-      "expires_at": "2026-03-28T22:42:16Z",
+    "46793a5892bfbd4ff42b8b92921301b1203c00f2da234255": {
+      "expires_at": "2026-03-28T07:29:57Z",
       "ip": "127.0.0.1",
-      "agent_fp": "c335f1a9d2fdddd2112124f7af5a0e5e"
+      "agent_fp": "31b61a1517a6fcd0ef7b42f52f05ea2d"
     }
   },
   "auth_logs": [
@@ -364,7 +364,7 @@
   ],
   "admin_device_lock": {
     "ip": "127.0.0.1",
-    "agent_fp": "c335f1a9d2fdddd2112124f7af5a0e5e",
-    "locked_at": "2026-03-28T10:42:16Z"
+    "agent_fp": "31b61a1517a6fcd0ef7b42f52f05ea2d",
+    "locked_at": "2026-03-27T19:29:57Z"
   }
 }

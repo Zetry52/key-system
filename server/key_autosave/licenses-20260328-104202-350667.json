@@ -74,13 +74,7 @@
       "max_users": 1
     }
   ],
-  "sessions": {
-    "d7da30cabfc142fa7d1f54f5019e214938491e9901ebdc44": {
-      "expires_at": "2026-03-28T22:42:16Z",
-      "ip": "127.0.0.1",
-      "agent_fp": "c335f1a9d2fdddd2112124f7af5a0e5e"
-    }
-  },
+  "sessions": {},
   "auth_logs": [
     {
       "timestamp": "2026-03-04T12:51:52Z",
@@ -362,9 +356,5 @@
       "message": "License not found"
     }
   ],
-  "admin_device_lock": {
-    "ip": "127.0.0.1",
-    "agent_fp": "c335f1a9d2fdddd2112124f7af5a0e5e",
-    "locked_at": "2026-03-28T10:42:16Z"
-  }
+  "admin_device_lock": {}
 }
