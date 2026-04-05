@@ -1548,8 +1548,7 @@ class LicenseHandler(BaseHTTPRequestHandler):
         parsed = parse_qs(body, keep_blank_values=True)
         return {key: values[0] for key, values in parsed.items()}
 
-=======
-﻿import argparse
+import argparse
 import hashlib
 import html
 import json
