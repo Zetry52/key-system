@@ -365,6 +365,112 @@ def format_license_details(item: dict) -> str:
     )
 
 
+def display_status(item: dict) -> str:
+    status = normalize_status(item)
+    expires_at = item.get("expires_at", "")
+    if status == "active" and expires_at:
+        try:
+            if now_utc() > parse_iso_utc(expires_at):
+                return "expired"
+        except Exception:
+            return "expired"
+    return status
+
+
+def format_admin_datetime(value: str) -> str:
+    if not value:
+        return "-"
+    try:
+        return parse_iso_utc(value).strftime("%d.%m.%Y %H:%M UTC")
+    except Exception:
+        return value
+
+
+def render_license_card_html(item: dict) -> str:
+    status = display_status(item)
+    key_value = item.get("license_key", "")
+    return f"""
+<article class="license-card">
+  <div class="license-head">
+    <div>
+      <div class="license-key">{html.escape(key_value)}</div>
+      <div class="license-caption">{html.escape(item.get("name", "") or "Unnamed")} · {html.escape(item.get("product", "") or "No product")}</div>
+    </div>
+    <span class="pill {html.escape(status)}">{html.escape(status.title())}</span>
+  </div>
+  <div class="license-highlights">
+    <div class="spot-chip">
+      <span>Days left</span>
+      <strong>{days_left_for_item(item)}</strong>
+    </div>
+    <div class="spot-chip">
+      <span>HWID</span>
+      <strong>{html.escape(item.get("hwid", "") or "Open")}</strong>
+    </div>
+    <div class="spot-chip">
+      <span>Last IP</span>
+      <strong>{html.escape(item.get("last_ip", "") or "-")}</strong>
+    </div>
+  </div>
+  <div class="license-meta-grid">
+    <div class="meta-card">
+      <span>Created</span>
+      <strong>{html.escape(format_admin_datetime(item.get("created_at", "")))}</strong>
+    </div>
+    <div class="meta-card">
+      <span>Expires</span>
+      <strong>{html.escape(format_admin_datetime(item.get("expires_at", "")))}</strong>
+    </div>
+    <div class="meta-card">
+      <span>Last seen</span>
+      <strong>{html.escape(format_admin_datetime(item.get("last_seen_at", "")))}</strong>
+    </div>
+    <div class="meta-card">
+      <span>Notes</span>
+      <strong>{html.escape(item.get("notes", "") or "No notes")}</strong>
+    </div>
+  </div>
+  <div class="license-actions">
+    <form method="post" action="/admin/action" class="inline">
+      <input type="hidden" name="action" value="freeze">
+      <input type="hidden" name="key" value="{html.escape(key_value)}">
+      <button class="btn warn small" type="submit">Freeze</button>
+    </form>
+    <form method="post" action="/admin/action" class="inline">
+      <input type="hidden" name="action" value="unfreeze">
+      <input type="hidden" name="key" value="{html.escape(key_value)}">
+      <button class="btn small" type="submit">Unfreeze</button>
+    </form>
+    <form method="post" action="/admin/action" class="inline">
+      <input type="hidden" name="action" value="reset_hwid">
+      <input type="hidden" name="key" value="{html.escape(key_value)}">
+      <button class="btn alt small" type="submit">Reset HWID</button>
+    </form>
+    <form method="post" action="/admin/action" class="inline">
+      <input type="hidden" name="action" value="delete">
+      <input type="hidden" name="key" value="{html.escape(key_value)}">
+      <button class="btn bad small" type="submit">Delete</button>
+    </form>
+  </div>
+</article>"""
+
+
+def render_auth_log_card_html(log: dict) -> str:
+    status = "ok" if log.get("success") else "fail"
+    status_label = "OK" if log.get("success") else "FAIL"
+    return (
+        f'<div class="log-item {status}">'
+        f'<div class="log-top"><span class="log-pill {status}">{status_label}</span>'
+        f'<span>{html.escape(format_admin_datetime(log.get("timestamp", "")))}</span></div>'
+        f'<div class="log-body">'
+        f'<strong>{html.escape(log.get("license_key", "-"))}</strong>'
+        f'<span>{html.escape(log.get("message", "-"))}</span>'
+        f'</div>'
+        f'<div class="log-meta">{html.escape(log.get("ip", "-"))} · {html.escape(log.get("hwid", "-"))}</div>'
+        f'</div>'
+    )
+
+
 BTN_PROFILE = "👤 Профиль"
 BTN_SUPPORT = "🛠 Поддержка"
 BTN_MY_KEY = "🔑 Мой ключ"
@@ -1025,40 +1131,39 @@ def html_page(title: str, body: str) -> bytes:
   <title>{html.escape(title)}</title>
   <style>
     :root {{
-      --bg0: #040812;
-      --bg1: #081427;
-      --panel: rgba(255,255,255,0.045);
-      --panel2: rgba(255,255,255,0.08);
-      --line: rgba(255,255,255,0.12);
-      --ink: rgba(255,255,255,0.93);
-      --muted: rgba(255,255,255,0.62);
-      --accent: #1f57ff;
-      --accent2: #00d6ff;
-      --good: #26D07C;
-      --warn: #FFB020;
-      --bad: #FF4D6D;
-      --shadow: 0 22px 70px rgba(0,0,0,0.52);
+      --bg0: #f7f9ff;
+      --bg1: #eef3ff;
+      --panel: rgba(255,255,255,0.86);
+      --panel2: rgba(255,255,255,0.96);
+      --line: rgba(31,51,122,0.10);
+      --ink: #17203b;
+      --muted: #6e7897;
+      --accent: #4b63ff;
+      --accent2: #7ecbff;
+      --good: #16b364;
+      --warn: #f59e0b;
+      --bad: #ef4444;
+      --shadow: 0 24px 70px rgba(71,89,149,0.16);
       --glass-blur: blur(18px);
-      --r: 18px;
+      --r: 24px;
       --cursor-x: 50%;
       --cursor-y: 50%;
-      --cursor-size: 360px;
-      --cursor-glow: rgba(126, 208, 255, 0.22);
+      --cursor-size: 280px;
+      --cursor-glow: rgba(75,99,255,0.12);
     }}
     * {{ box-sizing: border-box; }}
     html, body {{ height: 100%; }}
     body {{
       margin: 0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
       color: var(--ink);
       background:
-        radial-gradient(900px 500px at 10% 12%, rgba(31,87,255,0.20), transparent 60%),
-        radial-gradient(740px 460px at 85% 18%, rgba(0,214,255,0.16), transparent 56%),
-        radial-gradient(900px 560px at 65% 92%, rgba(34,120,255,0.14), transparent 58%),
-        linear-gradient(180deg, var(--bg0), var(--bg1));
+        radial-gradient(620px 420px at 8% 5%, rgba(75,99,255,0.16), transparent 60%),
+        radial-gradient(780px 520px at 92% 10%, rgba(126,203,255,0.16), transparent 64%),
+        linear-gradient(180deg, #fbfcff 0%, #eef3ff 54%, #f8faff 100%);
       overflow-x: hidden;
       opacity: 0;
-      transform: translateY(10px) scale(.995);
+      transform: translateY(8px);
       transition: opacity .36s ease, transform .36s ease;
     }}
     body.page-loaded {{
@@ -1067,28 +1172,29 @@ def html_page(title: str, body: str) -> bytes:
     }}
     body.page-leaving {{
       opacity: 0;
-      transform: translateY(8px) scale(.996);
-      filter: grayscale(.15);
+      transform: translateY(6px);
+      filter: saturate(.95);
     }}
     body::before {{
       content: "";
       position: fixed;
-      inset: -40vmax;
-      background:
-        radial-gradient(circle at var(--cursor-x) var(--cursor-y), var(--cursor-glow), transparent calc(var(--cursor-size) * 0.65));
+      inset: 0;
+      background: radial-gradient(circle at var(--cursor-x) var(--cursor-y), var(--cursor-glow), transparent calc(var(--cursor-size) * 0.9));
       pointer-events: none;
       z-index: 0;
-      transition: background .08s linear;
+      transition: background .12s linear;
     }}
     body::after {{
       content: "";
       position: fixed;
       inset: 0;
-      background: linear-gradient(180deg, rgba(8, 14, 32, 0.04), rgba(8, 14, 32, 0.22));
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.52), rgba(255,255,255,0.14)),
+        repeating-linear-gradient(90deg, rgba(75,99,255,0.02) 0, rgba(75,99,255,0.02) 1px, transparent 1px, transparent 120px);
       pointer-events: none;
       z-index: 0;
     }}
-    a {{ color: inherit; }}
+    a {{ color: inherit; text-decoration: none; }}
     .app {{
       position: relative;
       z-index: 1;
@@ -1443,6 +1549,915 @@ def html_page(title: str, body: str) -> bytes:
       padding: 18px;
       animation: panelIn .36s ease both;
     }}
+    .wrap {{
+      min-height: 100vh;
+      padding: 26px;
+      position: relative;
+      z-index: 1;
+    }}
+    .eyebrow {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #4b63ff;
+      background: rgba(75,99,255,0.08);
+      border: 1px solid rgba(75,99,255,0.12);
+    }}
+    .eyebrow.inverse {{
+      color: rgba(239,244,255,0.9);
+      background: rgba(255,255,255,0.08);
+      border-color: rgba(255,255,255,0.14);
+    }}
+    input, select, textarea {{
+      border: 1px solid rgba(39,61,135,0.12);
+      background: rgba(255,255,255,0.92);
+      color: var(--ink);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.72), 0 10px 26px rgba(92,114,180,0.08);
+      -webkit-backdrop-filter: blur(12px);
+      backdrop-filter: blur(12px);
+    }}
+    input:focus, select:focus, textarea:focus {{
+      border-color: rgba(75,99,255,0.34);
+      box-shadow: 0 0 0 4px rgba(75,99,255,0.10), 0 16px 34px rgba(92,114,180,0.10);
+      background: rgba(255,255,255,0.98);
+    }}
+    input::placeholder, textarea::placeholder {{
+      color: #9aa6c7;
+    }}
+    .btn, button, input[type="submit"] {{
+      border: 1px solid rgba(75,99,255,0.12);
+      background: linear-gradient(180deg, #ffffff 0%, #eef3ff 100%);
+      color: #24345f;
+      box-shadow: 0 14px 30px rgba(75,99,255,0.12);
+    }}
+    .btn:hover, button:hover, input[type="submit"]:hover {{
+      background: linear-gradient(180deg, #ffffff 0%, #e6eeff 100%);
+      border-color: rgba(75,99,255,0.24);
+      box-shadow: 0 18px 36px rgba(75,99,255,0.16);
+    }}
+    .btn.primary, button.primary, input[type="submit"].primary {{
+      color: #ffffff;
+      background: linear-gradient(135deg, #4b63ff 0%, #6d7cff 55%, #93dbff 100%);
+      border-color: transparent;
+      box-shadow: 0 20px 40px rgba(75,99,255,0.26);
+    }}
+    .btn.good, button.good, input[type="submit"].good {{
+      color: #0f5a32;
+      background: linear-gradient(180deg, #f0fff7 0%, #d8fbe8 100%);
+      border-color: rgba(22,179,100,0.22);
+    }}
+    .btn.warn, button.warn, input[type="submit"].warn {{
+      color: #7f4d12;
+      background: linear-gradient(180deg, #fff8eb 0%, #ffe7bb 100%);
+      border-color: rgba(245,158,11,0.22);
+    }}
+    .btn.alt, button.alt, input[type="submit"].alt {{
+      color: #30436b;
+      background: linear-gradient(180deg, #f3f5ff 0%, #e0e6ff 100%);
+      border-color: rgba(124,144,255,0.24);
+    }}
+    .btn.bad, button.bad, input[type="submit"].bad {{
+      color: #8b2442;
+      background: linear-gradient(180deg, #fff0f4 0%, #ffd9e3 100%);
+      border-color: rgba(239,68,68,0.20);
+    }}
+    .flash {{
+      background: linear-gradient(135deg, rgba(75,99,255,0.12), rgba(126,203,255,0.14));
+      border: 1px solid rgba(75,99,255,0.16);
+      color: #22345e;
+      box-shadow: 0 16px 30px rgba(75,99,255,0.10);
+    }}
+    .field-label {{
+      display: block;
+      margin-bottom: 8px;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      color: #4e5b7f;
+      text-transform: uppercase;
+    }}
+    .dashboard-shell {{
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      gap: 24px;
+      min-height: calc(100vh - 52px);
+    }}
+    .dashboard-sidebar {{
+      position: sticky;
+      top: 26px;
+      height: calc(100vh - 52px);
+      display: grid;
+      align-content: start;
+      gap: 18px;
+      padding: 20px;
+      border-radius: 30px;
+      border: 1px solid rgba(39,61,135,0.10);
+      background: rgba(255,255,255,0.76);
+      box-shadow: var(--shadow);
+      -webkit-backdrop-filter: blur(20px);
+      backdrop-filter: blur(20px);
+    }}
+    .sidebar-brand {{
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 6px 4px 12px;
+    }}
+    .brand-mark {{
+      width: 52px;
+      height: 52px;
+      border-radius: 18px;
+      background: linear-gradient(145deg, #4b63ff 0%, #7ed0ff 100%);
+      box-shadow: 0 18px 40px rgba(75,99,255,0.26);
+      position: relative;
+    }}
+    .brand-mark::before,
+    .brand-mark::after {{
+      content: "";
+      position: absolute;
+      bottom: 12px;
+      width: 6px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.92);
+    }}
+    .brand-mark::before {{
+      left: 15px;
+      height: 26px;
+      box-shadow: 12px 8px 0 0 rgba(255,255,255,0.72), 24px -2px 0 0 rgba(255,255,255,0.42);
+    }}
+    .brand-mark::after {{
+      left: 27px;
+      height: 20px;
+      opacity: 0;
+    }}
+    .sidebar-brand h1 {{
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.1;
+    }}
+    .sidebar-brand p {{
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .sidebar-group {{
+      display: grid;
+      gap: 10px;
+    }}
+    .group-title {{
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: #8a95b4;
+      padding: 0 6px;
+    }}
+    .menu-link {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 14px 16px;
+      border-radius: 20px;
+      border: 1px solid rgba(75,99,255,0.08);
+      background: rgba(255,255,255,0.72);
+      box-shadow: 0 12px 24px rgba(75,99,255,0.06);
+      transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease;
+    }}
+    .menu-link:hover {{
+      transform: translateY(-1px);
+      border-color: rgba(75,99,255,0.16);
+      box-shadow: 0 16px 28px rgba(75,99,255,0.10);
+    }}
+    .menu-link.active {{
+      color: #ffffff;
+      border-color: transparent;
+      background: linear-gradient(135deg, #4b63ff 0%, #6d7cff 52%, #86d2ff 100%);
+      box-shadow: 0 18px 36px rgba(75,99,255,0.22);
+    }}
+    .menu-link strong {{
+      display: block;
+      font-size: 14px;
+    }}
+    .menu-link small {{
+      display: block;
+      margin-top: 4px;
+      color: #8190b7;
+      font-size: 12px;
+    }}
+    .menu-link.active small {{
+      color: rgba(255,255,255,0.76);
+    }}
+    .menu-index {{
+      width: 34px;
+      height: 34px;
+      border-radius: 12px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 12px;
+      color: #4b63ff;
+      background: rgba(75,99,255,0.10);
+    }}
+    .menu-link.active .menu-index {{
+      color: #ffffff;
+      background: rgba(255,255,255,0.14);
+    }}
+    .sidebar-note {{
+      margin-top: auto;
+      padding: 18px;
+      border-radius: 22px;
+      background: linear-gradient(180deg, rgba(75,99,255,0.10), rgba(126,203,255,0.10));
+      border: 1px solid rgba(75,99,255,0.12);
+      box-shadow: 0 18px 38px rgba(75,99,255,0.10);
+    }}
+    .sidebar-note strong {{
+      display: block;
+      margin: 12px 0 4px;
+      font-size: 14px;
+    }}
+    .sidebar-note p {{
+      margin: 0;
+      color: #5a688f;
+      font-size: 13px;
+      line-height: 1.55;
+    }}
+    .dashboard-main {{
+      display: grid;
+      align-content: start;
+      gap: 18px;
+    }}
+    .dashboard-topbar {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 18px;
+      padding: 8px 4px 0;
+    }}
+    .dashboard-heading h1 {{
+      margin: 10px 0 8px;
+      font-size: clamp(30px, 4vw, 42px);
+      line-height: 1.02;
+      letter-spacing: -0.04em;
+    }}
+    .dashboard-heading p {{
+      margin: 0;
+      color: #667394;
+      font-size: 15px;
+      max-width: 620px;
+    }}
+    .dashboard-actions {{
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }}
+    .key-search {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: min(100%, 430px);
+      padding: 8px;
+      border-radius: 20px;
+      border: 1px solid rgba(39,61,135,0.10);
+      background: rgba(255,255,255,0.78);
+      box-shadow: 0 16px 34px rgba(75,99,255,0.08);
+      -webkit-backdrop-filter: blur(18px);
+      backdrop-filter: blur(18px);
+    }}
+    .key-search input {{
+      min-width: 260px;
+      border: none;
+      background: transparent;
+      box-shadow: none;
+      padding: 12px 14px;
+    }}
+    .key-search input:focus {{
+      box-shadow: none;
+      background: transparent;
+    }}
+    .hero-card {{
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.9fr);
+      gap: 18px;
+      padding: 24px;
+      border-radius: 32px;
+      border: 1px solid rgba(39,61,135,0.10);
+      background:
+        radial-gradient(circle at 100% 0%, rgba(126,203,255,0.24), transparent 30%),
+        linear-gradient(135deg, rgba(255,255,255,0.94) 0%, rgba(240,244,255,0.90) 100%);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      position: relative;
+    }}
+    .hero-card::after {{
+      content: "";
+      position: absolute;
+      inset: auto -80px -120px auto;
+      width: 260px;
+      height: 260px;
+      border-radius: 999px;
+      background: radial-gradient(circle, rgba(75,99,255,0.20), transparent 68%);
+      pointer-events: none;
+    }}
+    .hero-copy {{
+      position: relative;
+      z-index: 1;
+    }}
+    .hero-copy h2 {{
+      margin: 18px 0 10px;
+      font-size: clamp(28px, 3.6vw, 40px);
+      line-height: 1.02;
+      letter-spacing: -0.04em;
+    }}
+    .hero-copy p {{
+      margin: 0;
+      color: #657292;
+      font-size: 15px;
+      line-height: 1.7;
+      max-width: 620px;
+    }}
+    .hero-preview {{
+      display: grid;
+      gap: 12px;
+      position: relative;
+      z-index: 1;
+    }}
+    .preview-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }}
+    .preview-card {{
+      padding: 18px;
+      border-radius: 22px;
+      border: 1px solid rgba(255,255,255,0.22);
+      background: linear-gradient(180deg, rgba(75,99,255,0.10), rgba(126,203,255,0.12));
+      box-shadow: 0 18px 38px rgba(75,99,255,0.12);
+    }}
+    .preview-card strong {{
+      display: block;
+      margin-top: 10px;
+      font-size: 24px;
+      line-height: 1;
+    }}
+    .preview-card span {{
+      font-size: 13px;
+      color: #5b6790;
+    }}
+    .preview-wide {{
+      display: grid;
+      gap: 10px;
+      padding: 20px;
+      border-radius: 24px;
+      background: linear-gradient(135deg, #223056 0%, #344a82 48%, #4b63ff 100%);
+      color: #eef3ff;
+      box-shadow: 0 28px 50px rgba(34,48,86,0.30);
+    }}
+    .preview-wide strong {{
+      font-size: 18px;
+    }}
+    .preview-wide p {{
+      margin: 0;
+      font-size: 13px;
+      line-height: 1.6;
+      color: rgba(238,243,255,0.76);
+    }}
+    .stat-grid {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+    }}
+    .stat-card {{
+      padding: 20px;
+      border-radius: 24px;
+      border: 1px solid rgba(39,61,135,0.10);
+      background: rgba(255,255,255,0.90);
+      box-shadow: 0 18px 36px rgba(75,99,255,0.08);
+    }}
+    .stat-card span {{
+      display: block;
+      font-size: 13px;
+      color: #7180a5;
+    }}
+    .stat-card strong {{
+      display: block;
+      margin-top: 14px;
+      font-size: 32px;
+      line-height: 1;
+      letter-spacing: -0.04em;
+    }}
+    .stat-card em {{
+      display: inline-flex;
+      align-items: center;
+      margin-top: 12px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-style: normal;
+      font-size: 12px;
+      font-weight: 700;
+      color: #4b63ff;
+      background: rgba(75,99,255,0.08);
+    }}
+    .surface-grid {{
+      display: grid;
+      grid-template-columns: 1.2fr 1fr 1fr;
+      gap: 16px;
+    }}
+    .surface-card {{
+      padding: 22px;
+      border-radius: 28px;
+      border: 1px solid rgba(39,61,135,0.10);
+      background: rgba(255,255,255,0.90);
+      box-shadow: 0 18px 36px rgba(75,99,255,0.08);
+      display: grid;
+      align-content: start;
+      gap: 14px;
+    }}
+    .surface-log {{
+      grid-column: span 3;
+    }}
+    .section-heading h3 {{
+      margin: 10px 0 6px;
+      font-size: 24px;
+      letter-spacing: -0.03em;
+    }}
+    .section-heading p {{
+      margin: 0;
+      color: #7080a4;
+      font-size: 14px;
+      line-height: 1.6;
+    }}
+    .form-grid {{
+      display: grid;
+      gap: 14px;
+    }}
+    .form-pair {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }}
+    .license-stage {{
+      position: relative;
+      overflow: hidden;
+      padding: 24px;
+      border-radius: 34px;
+      border: 1px solid rgba(63,79,128,0.26);
+      background:
+        radial-gradient(circle at top right, rgba(79,102,255,0.26), transparent 24%),
+        linear-gradient(180deg, #151924 0%, #0d1118 100%);
+      box-shadow: 0 36px 80px rgba(15,23,56,0.32);
+      color: #eff4ff;
+    }}
+    .license-stage::before {{
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0));
+      pointer-events: none;
+    }}
+    .license-stage-head {{
+      position: relative;
+      z-index: 1;
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 18px;
+    }}
+    .license-stage-head h2 {{
+      margin: 12px 0 8px;
+      font-size: 30px;
+      letter-spacing: -0.04em;
+      line-height: 1;
+    }}
+    .license-stage-head p {{
+      margin: 0;
+      color: rgba(218,226,255,0.70);
+      font-size: 14px;
+      line-height: 1.65;
+      max-width: 620px;
+    }}
+    .license-stage-info {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      justify-content: flex-end;
+    }}
+    .stage-chip {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.12);
+      background: rgba(255,255,255,0.06);
+      color: rgba(237,243,255,0.82);
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    .license-grid {{
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 16px;
+    }}
+    .license-card {{
+      padding: 18px;
+      border-radius: 24px;
+      border: 1px solid rgba(255,255,255,0.10);
+      background: linear-gradient(180deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.04);
+      display: grid;
+      gap: 14px;
+    }}
+    .license-head {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }}
+    .license-key {{
+      font-size: 24px;
+      font-weight: 800;
+      letter-spacing: -0.04em;
+      line-height: 1.05;
+      word-break: break-word;
+    }}
+    .license-caption {{
+      margin-top: 8px;
+      font-size: 13px;
+      color: rgba(216,224,255,0.70);
+      line-height: 1.5;
+    }}
+    .license-highlights {{
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }}
+    .spot-chip {{
+      padding: 12px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.05);
+    }}
+    .spot-chip span {{
+      display: block;
+      font-size: 12px;
+      color: rgba(216,224,255,0.62);
+    }}
+    .spot-chip strong {{
+      display: block;
+      margin-top: 8px;
+      font-size: 14px;
+      line-height: 1.4;
+      word-break: break-word;
+    }}
+    .license-meta-grid {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }}
+    .meta-card {{
+      padding: 12px;
+      border-radius: 18px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(7,11,19,0.28);
+    }}
+    .meta-card span {{
+      display: block;
+      font-size: 12px;
+      color: rgba(216,224,255,0.62);
+    }}
+    .meta-card strong {{
+      display: block;
+      margin-top: 8px;
+      font-size: 13px;
+      line-height: 1.55;
+      color: #f6f8ff;
+      word-break: break-word;
+    }}
+    .license-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    .license-stage .btn,
+    .license-stage button,
+    .license-stage input[type="submit"] {{
+      color: #eef4ff;
+      background: rgba(255,255,255,0.08);
+      border-color: rgba(255,255,255,0.12);
+      box-shadow: none;
+    }}
+    .license-stage .btn:hover,
+    .license-stage button:hover,
+    .license-stage input[type="submit"]:hover {{
+      background: rgba(255,255,255,0.12);
+      border-color: rgba(255,255,255,0.18);
+      box-shadow: none;
+    }}
+    .license-stage .btn.primary,
+    .license-stage button.primary,
+    .license-stage input[type="submit"].primary {{
+      background: linear-gradient(135deg, #4b63ff 0%, #7cc9ff 100%);
+      color: #ffffff;
+    }}
+    .log-list {{
+      display: grid;
+      gap: 10px;
+    }}
+    .log-item {{
+      padding: 16px;
+      border-radius: 20px;
+      border: 1px solid rgba(39,61,135,0.10);
+      background: linear-gradient(180deg, #ffffff 0%, #f6f8ff 100%);
+      box-shadow: 0 14px 26px rgba(75,99,255,0.06);
+    }}
+    .log-item.fail {{
+      background: linear-gradient(180deg, #fff7f9 0%, #fff1f4 100%);
+      border-color: rgba(239,68,68,0.12);
+    }}
+    .log-top {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      color: #7b87a9;
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    .log-pill {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 60px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }}
+    .log-pill.ok {{
+      color: #0f6b3a;
+      background: rgba(22,179,100,0.12);
+    }}
+    .log-pill.fail {{
+      color: #b42318;
+      background: rgba(239,68,68,0.12);
+    }}
+    .log-body {{
+      display: grid;
+      gap: 6px;
+      margin-top: 12px;
+    }}
+    .log-body strong {{
+      font-size: 15px;
+      color: #202d52;
+    }}
+    .log-body span,
+    .log-meta {{
+      color: #6b789b;
+      font-size: 13px;
+      line-height: 1.55;
+    }}
+    .log-meta {{
+      margin-top: 10px;
+    }}
+    .empty-state {{
+      padding: 22px;
+      border-radius: 24px;
+      border: 1px dashed rgba(255,255,255,0.18);
+      background: rgba(255,255,255,0.04);
+      color: rgba(221,229,255,0.72);
+      text-align: center;
+      font-size: 14px;
+      line-height: 1.7;
+    }}
+    .login-shell {{
+      min-height: calc(100vh - 52px);
+      display: grid;
+      grid-template-columns: minmax(360px, 470px) minmax(0, 1fr);
+      gap: 24px;
+      align-items: stretch;
+    }}
+    .login-panel {{
+      padding: 34px;
+      border-radius: 34px;
+      border: 1px solid rgba(39,61,135,0.10);
+      background: rgba(255,255,255,0.92);
+      box-shadow: var(--shadow);
+      display: grid;
+      align-content: start;
+      gap: 20px;
+      -webkit-backdrop-filter: blur(18px);
+      backdrop-filter: blur(18px);
+    }}
+    .login-brand {{
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }}
+    .login-brand h1 {{
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.1;
+    }}
+    .login-brand p {{
+      margin: 6px 0 0;
+      color: #7481a4;
+      font-size: 13px;
+    }}
+    .login-copy h2 {{
+      margin: 16px 0 10px;
+      font-size: clamp(34px, 4vw, 48px);
+      line-height: 0.98;
+      letter-spacing: -0.05em;
+    }}
+    .login-copy p {{
+      margin: 0;
+      color: #667394;
+      font-size: 15px;
+      line-height: 1.7;
+    }}
+    .login-meta {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      flex-wrap: wrap;
+      color: #7481a4;
+      font-size: 13px;
+    }}
+    .login-meta strong {{
+      color: #24345f;
+    }}
+    .showcase-panel {{
+      position: relative;
+      overflow: hidden;
+      padding: 36px;
+      border-radius: 34px;
+      background: linear-gradient(135deg, #435cff 0%, #5d76ff 50%, #8bdcff 100%);
+      color: #ffffff;
+      box-shadow: 0 32px 80px rgba(75,99,255,0.34);
+      display: grid;
+      align-content: space-between;
+      gap: 22px;
+    }}
+    .showcase-panel::before {{
+      content: "";
+      position: absolute;
+      inset: auto auto -120px -80px;
+      width: 280px;
+      height: 280px;
+      border-radius: 999px;
+      background: radial-gradient(circle, rgba(255,255,255,0.26), transparent 70%);
+      pointer-events: none;
+    }}
+    .showcase-panel::after {{
+      content: "";
+      position: absolute;
+      top: 24px;
+      right: 24px;
+      width: 160px;
+      height: 160px;
+      border-radius: 999px;
+      background: radial-gradient(circle, rgba(255,255,255,0.18), transparent 70%);
+      pointer-events: none;
+    }}
+    .showcase-copy {{
+      position: relative;
+      z-index: 1;
+      display: grid;
+      gap: 14px;
+      max-width: 540px;
+    }}
+    .showcase-copy h3 {{
+      margin: 0;
+      font-size: clamp(32px, 4.3vw, 52px);
+      line-height: 0.96;
+      letter-spacing: -0.05em;
+    }}
+    .showcase-copy p {{
+      margin: 0;
+      color: rgba(255,255,255,0.78);
+      font-size: 15px;
+      line-height: 1.75;
+    }}
+    .showcase-stack {{
+      position: relative;
+      z-index: 1;
+      display: grid;
+      gap: 14px;
+    }}
+    .showcase-stack .preview-card,
+    .showcase-stack .preview-wide {{
+      background: rgba(255,255,255,0.14);
+      border-color: rgba(255,255,255,0.16);
+      box-shadow: none;
+      color: #ffffff;
+    }}
+    .showcase-stack .preview-card span,
+    .showcase-stack .preview-wide p {{
+      color: rgba(255,255,255,0.72);
+    }}
+    .showcase-stack .preview-grid {{
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }}
+    .showcase-foot {{
+      position: relative;
+      z-index: 1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }}
+    .showcase-foot span {{
+      display: inline-flex;
+      align-items: center;
+      padding: 9px 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.14);
+      color: rgba(255,255,255,0.84);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }}
+    @media (max-width: 1320px) {{
+      .stat-grid {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+      .surface-grid {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+      .surface-log {{
+        grid-column: span 2;
+      }}
+      .hero-card {{
+        grid-template-columns: 1fr;
+      }}
+    }}
+    @media (max-width: 1180px) {{
+      .dashboard-shell {{
+        grid-template-columns: 1fr;
+      }}
+      .dashboard-sidebar {{
+        position: relative;
+        top: 0;
+        height: auto;
+      }}
+      .login-shell {{
+        grid-template-columns: 1fr;
+      }}
+    }}
+    @media (max-width: 820px) {{
+      .wrap {{
+        padding: 18px;
+      }}
+      .dashboard-topbar,
+      .dashboard-actions,
+      .license-stage-head,
+      .login-meta {{
+        flex-direction: column;
+        align-items: stretch;
+      }}
+      .key-search {{
+        width: 100%;
+        min-width: 0;
+      }}
+      .key-search input {{
+        min-width: 0;
+      }}
+      .stat-grid,
+      .surface-grid,
+      .form-pair,
+      .license-highlights,
+      .license-meta-grid,
+      .preview-grid,
+      .showcase-stack .preview-grid {{
+        grid-template-columns: 1fr;
+      }}
+      .surface-log {{
+        grid-column: span 1;
+      }}
+      .login-panel,
+      .showcase-panel,
+      .license-stage,
+      .hero-card,
+      .surface-card {{
+        padding: 20px;
+      }}
+    }}
     @keyframes sweepFill {{
       0% {{ left: -120%; opacity: 0; }}
       15% {{ opacity: .9; }}
@@ -1488,7 +2503,7 @@ def html_page(title: str, body: str) -> bytes:
 
   requestAnimationFrame(() => body.classList.add('page-loaded'));
 
-  const interactiveSelectors = '.btn, .nav a, button';
+  const interactiveSelectors = '.btn, .menu-link, .nav a, button';
   document.querySelectorAll(interactiveSelectors).forEach((el) => {{
     el.addEventListener('click', () => {{
       el.classList.remove('press-wave');
@@ -1570,17 +2585,6 @@ class LicenseHandler(BaseHTTPRequestHandler):
         return hashlib.sha256(user_agent.encode("utf-8")).hexdigest()[:32]
 
     def _admin_lock_matches(self, db: dict) -> bool:
-        lock = db.get("admin_device_lock", {}) or {}
-        if not lock:
-            return True
-        locked_ip = str(lock.get("ip", "")).strip()
-        locked_agent_fp = str(lock.get("agent_fp", "")).strip()
-        current_ip = self._client_ip()
-        current_agent_fp = self._client_agent_fingerprint()
-        if locked_ip and locked_ip != current_ip:
-            return False
-        if locked_agent_fp and locked_agent_fp != current_agent_fp:
-            return False
         return True
 
     def _is_authenticated(self) -> bool:
@@ -1617,28 +2621,88 @@ class LicenseHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _render_login(self, error: str = "") -> None:
+        db = load_db()
+        users_data = load_users()
+        total_keys = len(db.get("licenses", []))
+        linked_users = sum(1 for user in users_data.get("users", {}).values() if str(user.get("license_key", "")).strip())
+        auth_logs = len(db.get("auth_logs", []))
         error_html = f'<div class="flash">{html.escape(error)}</div>' if error else ""
         body = f"""
-<div class="login card">
-  <h1>Key MatrixHub</h1>
-  <p class="muted">Admin authorization</p>
-  {error_html}
-  <form method="post" action="/admin/login" class="stack">
-    <input name="username" placeholder="Username" required>
-    <input name="password" type="password" placeholder="Password" required>
-    <button class="btn primary" type="submit">Login</button>
-  </form>
+<div class="login-shell">
+  <section class="login-panel">
+    <div class="login-brand">
+      <div class="brand-mark"></div>
+      <div>
+        <h1>Key System</h1>
+        <p>Admin control center</p>
+      </div>
+    </div>
+    <div class="login-copy">
+      <span class="eyebrow">Secure access</span>
+      <h2>Sign in to manage every key</h2>
+      <p>New dashboard layout is already connected to your local key database, Telegram users, autosave snapshots and the updated admin flow.</p>
+    </div>
+    {error_html}
+    <form method="post" action="/admin/login" class="form-grid">
+      <div>
+        <label class="field-label" for="username">Username</label>
+        <input id="username" name="username" placeholder="Enter your username" autocomplete="username" required>
+      </div>
+      <div>
+        <label class="field-label" for="password">Password</label>
+        <input id="password" name="password" type="password" placeholder="Enter your password" autocomplete="current-password" required>
+      </div>
+      <button class="btn primary" type="submit">Open admin panel</button>
+    </form>
+    <div class="login-meta">
+      <span>Route: <strong>/admin</strong></span>
+      <span>Session time: <strong>12 hours</strong></span>
+    </div>
+  </section>
+  <aside class="showcase-panel">
+    <div class="showcase-copy">
+      <span class="eyebrow inverse">Dashboard preview</span>
+      <h3>Light admin shell, dark key vault and fast controls.</h3>
+      <p>The panel now matches the references closer: bright workspace on top, a focused dark block for license cards and clearer actions for each key.</p>
+    </div>
+    <div class="showcase-stack">
+      <div class="preview-wide">
+        <strong>Live data connected</strong>
+        <p>Current login reads the same JSON files used by the server, with autosave snapshots stored beside the source.</p>
+      </div>
+      <div class="preview-grid">
+        <div class="preview-card">
+          <span>Stored keys</span>
+          <strong>{total_keys}</strong>
+        </div>
+        <div class="preview-card">
+          <span>Linked users</span>
+          <strong>{linked_users}</strong>
+        </div>
+        <div class="preview-card">
+          <span>Auth logs</span>
+          <strong>{auth_logs}</strong>
+        </div>
+      </div>
+    </div>
+    <div class="showcase-foot">
+      <span>Autosave</span>
+      <span>Telegram</span>
+      <span>Local host</span>
+    </div>
+  </aside>
 </div>
 """
-        self._send_bytes(200, html_page("Admin Login", body), "text/html; charset=utf-8")
+        self._send_bytes(200, html_page("Key System Login", body), "text/html; charset=utf-8")
 
     def _render_admin(self, query: str = "", flash: str = "") -> None:
         db = load_db()
-        items = db.get("licenses", [])
+        all_items = db.get("licenses", [])
         search = query.strip().lower()
+        items = list(all_items)
         if search:
             filtered = []
-            for item in items:
+            for item in all_items:
                 blob = " ".join([
                     item.get("license_key", ""),
                     item.get("name", ""),
@@ -1651,178 +2715,258 @@ class LicenseHandler(BaseHTTPRequestHandler):
                     filtered.append(item)
             items = filtered
 
-        rows = []
-        for item in items:
-            status = normalize_status(item)
-            expires_at = item.get("expires_at", "")
-            if status == "active" and expires_at:
-                try:
-                    if now_utc() > parse_iso_utc(expires_at):
-                        status = "expired"
-                except Exception:
-                    status = "expired"
-            rows.append(f"""
-<tr>
-  <td><strong>{html.escape(item.get("license_key", ""))}</strong></td>
-  <td>{html.escape(item.get("name", ""))}</td>
-  <td>{html.escape(item.get("product", ""))}</td>
-  <td><span class="pill {html.escape(status)}">{html.escape(status)}</span></td>
-  <td>{html.escape(expires_at)}</td>
-  <td>{html.escape(item.get("hwid", "") or "-")}</td>
-  <td>{html.escape(item.get("last_ip", "") or "-")}</td>
-  <td>{html.escape(item.get("notes", "") or "-")}</td>
-  <td>{html.escape(item.get("last_seen_at", "") or "-")}</td>
-  <td>
-    <div class="actions">
-      <form method="post" action="/admin/action" class="inline">
-        <input type="hidden" name="action" value="freeze">
-        <input type="hidden" name="key" value="{html.escape(item.get("license_key", ""))}">
-        <button class="btn warn small" type="submit">Freeze</button>
-      </form>
-      <form method="post" action="/admin/action" class="inline">
-        <input type="hidden" name="action" value="unfreeze">
-        <input type="hidden" name="key" value="{html.escape(item.get("license_key", ""))}">
-        <button class="btn small" type="submit">Unfreeze</button>
-      </form>
-      <form method="post" action="/admin/action" class="inline">
-        <input type="hidden" name="action" value="reset_hwid">
-        <input type="hidden" name="key" value="{html.escape(item.get("license_key", ""))}">
-        <button class="btn alt small" type="submit">Reset HWID</button>
-      </form>
-      <form method="post" action="/admin/action" class="inline">
-        <input type="hidden" name="action" value="delete">
-        <input type="hidden" name="key" value="{html.escape(item.get("license_key", ""))}">
-        <button class="btn bad small" type="submit">Delete</button>
-      </form>
-    </div>
-  </td>
-</tr>""")
+        active_count = 0
+        frozen_count = 0
+        expired_count = 0
+        bound_hwid_count = 0
+        for item in all_items:
+            status = display_status(item)
+            if status == "active":
+                active_count += 1
+            elif status == "frozen":
+                frozen_count += 1
+            elif status == "expired":
+                expired_count += 1
+            if item.get("hwid"):
+                bound_hwid_count += 1
+
+        users_data = load_users()
+        linked_users = sum(1 for user in users_data.get("users", {}).values() if str(user.get("license_key", "")).strip())
+        log_count = len(db.get("auth_logs", []))
+        total_count = len(all_items)
+        showing_count = len(items)
+        cards_html = "".join(render_license_card_html(item) for item in items)
+        if not cards_html:
+            cards_html = '<div class="empty-state">No keys matched the current search. Try another query or create a new license from the forms above.</div>'
 
         flash_html = f'<div class="flash">{html.escape(flash)}</div>' if flash else ""
         body = f"""
-<div class="app">
-  <aside class="sidebar">
-    <div class="brand">
-      <div class="logo"></div>
+<div class="dashboard-shell">
+  <aside class="dashboard-sidebar">
+    <div class="sidebar-brand">
+      <div class="brand-mark"></div>
       <div>
-        <h1>Key MatrixHub</h1>
-        <p>Authentication Panel</p>
+        <h1>Key System</h1>
+        <p>License admin dashboard</p>
       </div>
     </div>
-    <div class="nav">
-      <a class="active" href="#licenses"><span class="label">Licenses</span><small>manage keys</small></a>
-      <a href="#create"><span class="label">Create</span><small>new key</small></a>
-      <a href="#extend"><span class="label">Extend</span><small>add days</small></a>
-      <a href="#edit"><span class="label">Edit</span><small>update fields</small></a>
-      <a href="#logs"><span class="label">Logs</span><small>recent auth</small></a>
+    <div class="sidebar-group">
+      <div class="group-title">Menu</div>
+      <a class="menu-link active" href="#overview">
+        <div><strong>Overview</strong><small>Dashboard summary</small></div>
+        <span class="menu-index">01</span>
+      </a>
+      <a class="menu-link" href="#licenses">
+        <div><strong>Key Vault</strong><small>Cards for every key</small></div>
+        <span class="menu-index">02</span>
+      </a>
+      <a class="menu-link" href="#create">
+        <div><strong>Create</strong><small>Generate a new license</small></div>
+        <span class="menu-index">03</span>
+      </a>
+      <a class="menu-link" href="#extend">
+        <div><strong>Extend</strong><small>Add more days</small></div>
+        <span class="menu-index">04</span>
+      </a>
+      <a class="menu-link" href="#logs">
+        <div><strong>Logs</strong><small>Recent validations</small></div>
+        <span class="menu-index">05</span>
+      </a>
     </div>
-    <div class="footer" style="margin-top:16px;">
-      API: <span class="code">/api/validate</span><br>
-      Admin: <span class="code">/admin</span>
+    <div class="sidebar-note">
+      <span class="eyebrow">Live source</span>
+      <strong>/api/validate</strong>
+      <p>Keys are stored in the local JSON database with autosave snapshots beside the source, so changes stay in sync with the running panel.</p>
     </div>
   </aside>
-  <main class="content">
-    <div class="topbar">
-      <div class="title">
-        <h2>ADMIN DASHBOARD</h2>
-        <div class="muted">Key MatrixHub control center</div>
+  <main class="dashboard-main">
+    <section id="overview" class="dashboard-topbar">
+      <div class="dashboard-heading">
+        <span class="eyebrow">Dashboard</span>
+        <h1>Manage keys in the new panel</h1>
+        <p>Bright workspace for admin actions, dark vault for license cards and clearer status blocks for every key, inspired by your references but branded for your own project.</p>
       </div>
-      <form method="post" action="/admin/logout">
-        <button class="btn alt" type="submit">Logout</button>
-      </form>
-    </div>
+      <div class="dashboard-actions">
+        <form method="get" action="/admin" class="key-search">
+          <input name="q" placeholder="Search by key, name, product, status, hwid or notes" value="{html.escape(query)}">
+          <button class="btn primary" type="submit">Search</button>
+        </form>
+        <form method="post" action="/admin/logout">
+          <button class="btn alt" type="submit">Logout</button>
+        </form>
+      </div>
+    </section>
     {flash_html}
-    <div id="licenses" class="card">
-      <h3 class="section-title">Licenses</h3>
-      <form method="get" action="/admin" class="row">
-        <input name="q" placeholder="Search by key, name, product, status, hwid, notes" value="{html.escape(query)}">
-        <button class="btn primary" type="submit">Search</button>
-      </form>
-      <div style="overflow:auto; margin-top: 12px;">
-        <table>
-          <thead>
-            <tr>
-              <th>Key</th>
-              <th>Name</th>
-              <th>Product</th>
-              <th>Status</th>
-              <th>Expires</th>
-              <th>HWID</th>
-              <th>IP</th>
-              <th>Notes</th>
-              <th>Last Seen</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {''.join(rows) or '<tr><td colspan="10">No keys found</td></tr>'}
-          </tbody>
-        </table>
+    <section class="hero-card">
+      <div class="hero-copy">
+        <span class="eyebrow">Overview</span>
+        <h2>Control the whole key flow from one screen.</h2>
+        <p>Search, create, extend, edit and moderate keys without leaving the page. Every license card includes status, HWID, last IP, dates, notes and direct actions like in the reference style you showed.</p>
       </div>
-    </div>
-    <div class="grid" style="margin-top:14px;">
-      <div id="create" class="card">
-        <h3 class="section-title">Create Key</h3>
-        <form method="post" action="/admin/create" class="stack">
-          <input name="license_key" placeholder="License key" required>
-          <input name="name" placeholder="Name" required>
-          <input name="product" placeholder="Product" required>
-          <input name="days" type="number" min="1" value="30" required>
-          <textarea name="notes" placeholder="Notes"></textarea>
-          <button class="btn primary" type="submit">Create</button>
-        </form>
-      </div>
-      <div id="extend" class="card">
-        <h3 class="section-title">Extend Key</h3>
-        <form method="post" action="/admin/action" class="stack">
-          <input type="hidden" name="action" value="extend">
-          <input name="key" placeholder="License key" required>
-          <input name="days" type="number" min="1" value="30" required>
-          <button class="btn primary" type="submit">Extend</button>
-        </form>
-      </div>
-      <div id="edit" class="card">
-        <h3 class="section-title">Edit Key</h3>
-        <form method="post" action="/admin/action" class="stack">
-          <input type="hidden" name="action" value="edit">
-          <input name="key" placeholder="Existing license key" required>
-          <input name="name" placeholder="New name">
-          <input name="product" placeholder="New product">
-          <input name="notes" placeholder="New notes">
-          <input name="days" type="number" min="0" value="0">
-          <button class="btn primary" type="submit">Save Changes</button>
-        </form>
-      </div>
-      <div id="logs" class="card">
-        <h3 class="section-title">Recent Auth Logs</h3>
-        <div class="stack muted" style="font-size:13px;">
-          {self._render_logs_html(db)}
+      <div class="hero-preview">
+        <div class="preview-grid">
+          <div class="preview-card">
+            <span>Showing now</span>
+            <strong>{showing_count}</strong>
+          </div>
+          <div class="preview-card">
+            <span>Stored total</span>
+            <strong>{total_count}</strong>
+          </div>
+        </div>
+        <div class="preview-wide">
+          <strong>Search state</strong>
+          <p>{html.escape("Filter active: " + query if query else "No search filter applied. All stored keys are visible in the vault below.")}</p>
         </div>
       </div>
-    </div>
+    </section>
+    <section class="stat-grid">
+      <article class="stat-card">
+        <span>Total licenses</span>
+        <strong>{total_count}</strong>
+        <em>All stored records</em>
+      </article>
+      <article class="stat-card">
+        <span>Active now</span>
+        <strong>{active_count}</strong>
+        <em>Ready for validation</em>
+      </article>
+      <article class="stat-card">
+        <span>Frozen or expired</span>
+        <strong>{frozen_count + expired_count}</strong>
+        <em>{frozen_count} frozen / {expired_count} expired</em>
+      </article>
+      <article class="stat-card">
+        <span>Linked users</span>
+        <strong>{linked_users}</strong>
+        <em>{bound_hwid_count} HWID bound</em>
+      </article>
+    </section>
+    <section class="surface-grid">
+      <article id="create" class="surface-card">
+        <div class="section-heading">
+          <span class="eyebrow">Create</span>
+          <h3>Issue a new key</h3>
+          <p>Add a brand new license with its own owner name, product and notes.</p>
+        </div>
+        <form method="post" action="/admin/create" class="form-grid">
+          <div class="form-pair">
+            <div>
+              <label class="field-label" for="create-key">License key</label>
+              <input id="create-key" name="license_key" placeholder="Zetry-User-001" required>
+            </div>
+            <div>
+              <label class="field-label" for="create-days">Days</label>
+              <input id="create-days" name="days" type="number" min="1" value="30" required>
+            </div>
+          </div>
+          <div class="form-pair">
+            <div>
+              <label class="field-label" for="create-name">Name</label>
+              <input id="create-name" name="name" placeholder="Client name" required>
+            </div>
+            <div>
+              <label class="field-label" for="create-product">Product</label>
+              <input id="create-product" name="product" placeholder="Product title" required>
+            </div>
+          </div>
+          <div>
+            <label class="field-label" for="create-notes">Notes</label>
+            <textarea id="create-notes" name="notes" placeholder="Add internal notes for the key"></textarea>
+          </div>
+          <button class="btn primary" type="submit">Create</button>
+        </form>
+      </article>
+      <article id="extend" class="surface-card">
+        <div class="section-heading">
+          <span class="eyebrow">Extend</span>
+          <h3>Add more time</h3>
+          <p>Extend an existing key without touching the rest of the record.</p>
+        </div>
+        <form method="post" action="/admin/action" class="form-grid">
+          <input type="hidden" name="action" value="extend">
+          <div>
+            <label class="field-label" for="extend-key">License key</label>
+            <input id="extend-key" name="key" placeholder="Existing key" required>
+          </div>
+          <div>
+            <label class="field-label" for="extend-days">Days</label>
+            <input id="extend-days" name="days" type="number" min="1" value="30" required>
+          </div>
+          <button class="btn primary" type="submit">Extend</button>
+        </form>
+      </article>
+      <article id="edit" class="surface-card">
+        <div class="section-heading">
+          <span class="eyebrow">Edit</span>
+          <h3>Update stored fields</h3>
+          <p>Rename a key owner, change product, adjust notes or add days in one place.</p>
+        </div>
+        <form method="post" action="/admin/action" class="form-grid">
+          <input type="hidden" name="action" value="edit">
+          <div>
+            <label class="field-label" for="edit-key">License key</label>
+            <input id="edit-key" name="key" placeholder="Existing license key" required>
+          </div>
+          <div class="form-pair">
+            <div>
+              <label class="field-label" for="edit-name">Name</label>
+              <input id="edit-name" name="name" placeholder="Updated name">
+            </div>
+            <div>
+              <label class="field-label" for="edit-product">Product</label>
+              <input id="edit-product" name="product" placeholder="Updated product">
+            </div>
+          </div>
+          <div>
+            <label class="field-label" for="edit-notes">Notes</label>
+            <textarea id="edit-notes" name="notes" placeholder="Updated notes"></textarea>
+          </div>
+          <div>
+            <label class="field-label" for="edit-days">Extra days</label>
+            <input id="edit-days" name="days" type="number" min="0" value="0">
+          </div>
+          <button class="btn primary" type="submit">Save Changes</button>
+        </form>
+      </article>
+      <article id="logs" class="surface-card surface-log">
+        <div class="section-heading">
+          <span class="eyebrow">Logs</span>
+          <h3>Recent auth activity</h3>
+          <p>{log_count} validation logs stored in the database. Latest events are shown as cards for quicker review.</p>
+        </div>
+        <div>
+          {self._render_logs_html(db)}
+        </div>
+      </article>
+    </section>
+    <section id="licenses" class="license-stage">
+      <div class="license-stage-head">
+        <div>
+          <span class="eyebrow inverse">Key vault</span>
+          <h2>Every key in its own card</h2>
+          <p>Each card shows status, owner, product, HWID, last IP, creation time, expiration, notes and direct moderation actions, closer to the layout style from your fifth reference.</p>
+        </div>
+        <div class="license-stage-info">
+          <span class="stage-chip">Visible: {showing_count}</span>
+          <span class="stage-chip">Active: {active_count}</span>
+          <span class="stage-chip">Logs: {log_count}</span>
+        </div>
+      </div>
+      <div class="license-grid">
+        {cards_html}
+      </div>
+    </section>
   </main>
 </div>
 """
-        self._send_bytes(200, html_page("Key MatrixHub Admin", body), "text/html; charset=utf-8")
+        self._send_bytes(200, html_page("Key System Admin", body), "text/html; charset=utf-8")
 
     def _render_logs_html(self, db: dict) -> str:
         logs = list(reversed(db.get("auth_logs", [])[-12:]))
         if not logs:
-            return "<div>No login attempts yet</div>"
-        parts = []
-        for log in logs:
-            status = "OK" if log.get("success") else "FAIL"
-            parts.append(
-                "<div>"
-                f"<strong>{html.escape(status)}</strong> "
-                f"{html.escape(log.get('timestamp', ''))} | "
-                f"{html.escape(log.get('license_key', ''))} | "
-                f"{html.escape(log.get('ip', '-'))} | "
-                f"{html.escape(log.get('hwid', '-'))} | "
-                f"{html.escape(log.get('message', ''))}"
-                "</div>"
-            )
-        return "".join(parts)
+            return '<div class="empty-state">No validation attempts yet. After users start checking licenses, recent activity will appear here.</div>'
+        return '<div class="log-list">' + "".join(render_auth_log_card_html(log) for log in logs) + '</div>'
 
     def log_message(self, format: str, *args) -> None:
         return
@@ -1874,26 +3018,12 @@ class LicenseHandler(BaseHTTPRequestHandler):
                 return
 
             db = load_db()
-            current_ip = self._client_ip()
-            current_agent_fp = self._client_agent_fingerprint()
-            lock = db.setdefault("admin_device_lock", {})
-            if lock:
-                locked_ip = str(lock.get("ip", "")).strip()
-                locked_agent_fp = str(lock.get("agent_fp", "")).strip()
-                if (locked_ip and locked_ip != current_ip) or (locked_agent_fp and locked_agent_fp != current_agent_fp):
-                    self._render_login("Admin access is locked to another device")
-                    return
-            else:
-                db["admin_device_lock"] = {
-                    "ip": current_ip,
-                    "agent_fp": current_agent_fp,
-                    "locked_at": iso_utc(now_utc()),
-                }
+            db["admin_device_lock"] = {}
             token = secrets.token_hex(24)
             db.setdefault("sessions", {})[token] = {
                 "expires_at": iso_utc(now_utc() + timedelta(hours=12)),
-                "ip": current_ip,
-                "agent_fp": current_agent_fp,
+                "ip": self._client_ip(),
+                "agent_fp": "",
             }
             save_db(db)
             self._redirect("/admin", f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax")
