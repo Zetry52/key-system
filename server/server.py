@@ -1,9 +1,11 @@
 ﻿import argparse
 import hashlib
+import hmac
 import html
 import json
 import os
 import secrets
+import shutil
 import threading
 import time
 from copy import deepcopy
@@ -16,16 +18,55 @@ from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 
-DATA_FILE = Path(__file__).with_name("licenses.json")
-CONFIG_FILE = Path(__file__).with_name("config.json")
-USERS_FILE = Path(__file__).with_name("telegram_users.json")
+APP_DIR = Path(__file__).resolve().parent
+LEGACY_DATA_FILE = APP_DIR / "licenses.json"
+LEGACY_CONFIG_FILE = APP_DIR / "config.json"
+LEGACY_USERS_FILE = APP_DIR / "telegram_users.json"
+DEFAULT_API_SHARED_SECRET = "c1ed92191db24a669a2c88b2e918a719681ae8d77c21d7596854cbb2c11d0c31"
 SESSION_COOKIE = "ks_admin_session"
+LOGIN_CSRF_COOKIE = "ks_login_csrf"
+API_SIGNATURE_HEADER = "X-KeySystem-Signature"
+API_TIMESTAMP_HEADER = "X-KeySystem-Timestamp"
+API_NONCE_HEADER = "X-KeySystem-Nonce"
+PBKDF2_ROUNDS = 240_000
+LOGIN_ATTEMPT_WINDOW_SECONDS = 600
+LOGIN_ATTEMPT_LIMIT = 6
+DEFAULT_API_SIGNATURE_TTL_SECONDS = 300
+SNAPSHOT_KEEP_LIMIT = 60
+SECURITY_LOG_KEEP_BYTES = 1_500_000
+MOSCOW_TZ = timezone(timedelta(hours=3), "MSK")
+
+STORAGE_LOCK = threading.RLock()
+TELEGRAM_CALLBACK_LOCK = threading.RLock()
+TELEGRAM_CALLBACK_TOKENS: dict[str, dict] = {}
+LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+SNAPSHOT_STATE: dict[str, dict[str, float | str]] = {}
+
+
+def resolve_data_dir() -> Path:
+    explicit = str(os.environ.get("KEY_SYSTEM_DATA_DIR", "")).strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    for env_name in ("RENDER_DISK_PATH", "RENDER_DISK_ROOT"):
+        raw = str(os.environ.get(env_name, "")).strip()
+        if raw:
+            return Path(raw).expanduser() / "key-system-data"
+    return APP_DIR
+
+
+DATA_DIR = resolve_data_dir()
+DATA_FILE = DATA_DIR / "licenses.json"
+CONFIG_FILE = DATA_DIR / "config.json"
+USERS_FILE = DATA_DIR / "telegram_users.json"
+BACKUP_DIR = DATA_DIR / "key_autosave"
+SECURITY_LOG_FILE = DATA_DIR / "security_events.jsonl"
 
 
 def default_config() -> dict:
     return {
         "admin_username": "admin",
         "admin_password": "changeme",
+        "admin_password_hash": "",
         "telegram_token": "",
         "telegram_admin_chat_ids": [],
         "telegram_last_update_id": 0,
@@ -33,6 +74,9 @@ def default_config() -> dict:
         "bot_info_text": "Key system bot",
         "user_sticker_id": "",
         "admin_sticker_id": "",
+        "api_shared_secret": DEFAULT_API_SHARED_SECRET,
+        "api_signature_ttl_seconds": DEFAULT_API_SIGNATURE_TTL_SECONDS,
+        "admin_session_hours": 12,
     }
 
 
@@ -51,44 +95,211 @@ def parse_iso_utc(value: str) -> datetime:
 
 
 def default_db() -> dict:
-    return {"licenses": [], "sessions": {}, "auth_logs": [], "admin_device_lock": {}}
+    return {
+        "licenses": [],
+        "sessions": {},
+        "auth_logs": [],
+        "admin_device_lock": {},
+        "api_nonces": {},
+    }
 
 
 def default_users() -> dict:
     return {"users": {}}
 
 
+def serialize_json(payload: dict) -> str:
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+def write_text_atomic(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.tmp")
+    temp_path.write_text(content, encoding="utf-8")
+    os.replace(temp_path, path)
+
+
+def write_json_atomic(path: Path, payload: dict) -> None:
+    write_text_atomic(path, serialize_json(payload))
+
+
+def ensure_storage_layout() -> None:
+    with STORAGE_LOCK:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        migrations = (
+            (DATA_FILE, LEGACY_DATA_FILE, default_db),
+            (CONFIG_FILE, LEGACY_CONFIG_FILE, default_config),
+            (USERS_FILE, LEGACY_USERS_FILE, default_users),
+        )
+        for target, legacy, factory in migrations:
+            if target.exists():
+                continue
+            if target != legacy and legacy.exists():
+                shutil.copy2(legacy, target)
+            else:
+                write_json_atomic(target, factory())
+
+
+def read_json_with_defaults(path: Path, default_factory) -> dict:
+    ensure_storage_layout()
+    with STORAGE_LOCK:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            latest_backup = BACKUP_DIR / f"{path.stem}.latest.json"
+            if latest_backup.exists():
+                payload = json.loads(latest_backup.read_text(encoding="utf-8"))
+                write_json_atomic(path, payload)
+                log_security_event(
+                    "storage_restore_from_backup",
+                    source="storage",
+                    level="error",
+                    details=f"Recovered {path.name} from latest backup after JSON corruption",
+                )
+            else:
+                payload = default_factory()
+        except FileNotFoundError:
+            payload = default_factory()
+        return payload
+
+
+def trim_security_log_file() -> None:
+    if not SECURITY_LOG_FILE.exists():
+        return
+    if SECURITY_LOG_FILE.stat().st_size <= SECURITY_LOG_KEEP_BYTES:
+        return
+    content = SECURITY_LOG_FILE.read_text(encoding="utf-8", errors="ignore")
+    trimmed = content[-SECURITY_LOG_KEEP_BYTES:]
+    first_newline = trimmed.find("\n")
+    if first_newline != -1:
+        trimmed = trimmed[first_newline + 1:]
+    write_text_atomic(SECURITY_LOG_FILE, trimmed)
+
+
+def log_security_event(event_type: str, *, source: str, ip: str = "", user_id: int | str | None = None,
+                       level: str = "warning", details: str = "", extra: dict | None = None) -> None:
+    ensure_storage_layout()
+    payload = {
+        "timestamp": iso_utc(now_utc()),
+        "type": event_type,
+        "source": source,
+        "level": level,
+        "ip": ip,
+        "user_id": "" if user_id is None else str(user_id),
+        "details": details,
+        "extra": extra or {},
+    }
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    with STORAGE_LOCK:
+        SECURITY_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with SECURITY_LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+        trim_security_log_file()
+
+
+def snapshot_json_file(prefix: str, payload: dict, *, keep: int = SNAPSHOT_KEEP_LIMIT,
+                       min_interval_seconds: int = 180) -> None:
+    ensure_storage_layout()
+    encoded = serialize_json(payload)
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    latest_path = BACKUP_DIR / f"{prefix}.latest.json"
+    write_text_atomic(latest_path, encoded)
+
+    now_ts = time.time()
+    state = SNAPSHOT_STATE.get(prefix, {})
+    if state.get("digest") == digest and now_ts - float(state.get("timestamp", 0.0)) < min_interval_seconds:
+        return
+
+    timestamp = now_utc().strftime("%Y%m%d-%H%M%S-%f")
+    snapshot_path = BACKUP_DIR / f"{prefix}-{timestamp}.json"
+    write_text_atomic(snapshot_path, encoded)
+    snapshots = sorted(BACKUP_DIR.glob(f"{prefix}-*.json"))
+    for old_path in snapshots[:-keep]:
+        old_path.unlink(missing_ok=True)
+    SNAPSHOT_STATE[prefix] = {"digest": digest, "timestamp": now_ts}
+
+
+def hash_password_value(password: str, *, salt: bytes | None = None) -> str:
+    if salt is None:
+        salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PBKDF2_ROUNDS)
+    return f"pbkdf2_sha256${PBKDF2_ROUNDS}${salt.hex()}${digest.hex()}"
+
+
+def verify_password_hash(stored_hash: str, password: str) -> bool:
+    try:
+        scheme, rounds_raw, salt_hex, digest_hex = stored_hash.split("$", 3)
+        if scheme != "pbkdf2_sha256":
+            return False
+        rounds = int(rounds_raw)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
+    except Exception:
+        return False
+    candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, rounds)
+    return hmac.compare_digest(candidate, expected)
+
 def load_db() -> dict:
-    if not DATA_FILE.exists():
-        return default_db()
-    db = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+    db = read_json_with_defaults(DATA_FILE, default_db)
     db.setdefault("licenses", [])
     db.setdefault("sessions", {})
     db.setdefault("auth_logs", [])
     db.setdefault("admin_device_lock", {})
+    db.setdefault("api_nonces", {})
     return db
 
 
+def prune_expired_sessions(db: dict) -> None:
+    sessions = db.setdefault("sessions", {})
+    expired_tokens = []
+    for token, session in sessions.items():
+        expires_at = session if isinstance(session, str) else session.get("expires_at", "")
+        if not expires_at:
+            expired_tokens.append(token)
+            continue
+        try:
+            if now_utc() > parse_iso_utc(expires_at):
+                expired_tokens.append(token)
+        except Exception:
+            expired_tokens.append(token)
+    for token in expired_tokens:
+        sessions.pop(token, None)
+
+
+def prune_api_nonces(db: dict, ttl_seconds: int = DEFAULT_API_SIGNATURE_TTL_SECONDS) -> None:
+    nonces = db.setdefault("api_nonces", {})
+    cutoff = now_utc() - timedelta(seconds=max(30, ttl_seconds))
+    for nonce, timestamp in list(nonces.items()):
+        try:
+            if parse_iso_utc(timestamp) < cutoff:
+                nonces.pop(nonce, None)
+        except Exception:
+            nonces.pop(nonce, None)
+
+
 def save_db(db: dict) -> None:
-    DATA_FILE.write_text(json.dumps(db, indent=2), encoding="utf-8")
+    prune_expired_sessions(db)
+    prune_api_nonces(db)
+    with STORAGE_LOCK:
+        write_json_atomic(DATA_FILE, db)
+    snapshot_json_file("licenses", db, min_interval_seconds=120)
 
 
 def load_users() -> dict:
-    if not USERS_FILE.exists():
-        return default_users()
-    data = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+    data = read_json_with_defaults(USERS_FILE, default_users)
     data.setdefault("users", {})
     return data
 
 
 def save_users(data: dict) -> None:
-    USERS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    with STORAGE_LOCK:
+        write_json_atomic(USERS_FILE, data)
+    snapshot_json_file("telegram_users", data, keep=25, min_interval_seconds=180)
 
 
 def load_config() -> dict:
-    if not CONFIG_FILE.exists():
-        return default_config()
-    config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    config = read_json_with_defaults(CONFIG_FILE, default_config)
     defaults = default_config()
     for key, value in defaults.items():
         config.setdefault(key, value)
@@ -96,18 +307,191 @@ def load_config() -> dict:
 
 
 def save_config(config: dict) -> None:
-    CONFIG_FILE.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    with STORAGE_LOCK:
+        write_json_atomic(CONFIG_FILE, config)
+    snapshot_json_file("config", config, keep=12, min_interval_seconds=600)
+
+
+def get_api_shared_secret(config: dict | None = None) -> str:
+    env_secret = str(os.environ.get("KEY_SYSTEM_API_SECRET", "")).strip()
+    if env_secret:
+        return env_secret
+    active_config = config or load_config()
+    secret = str(active_config.get("api_shared_secret", "")).strip()
+    return secret or DEFAULT_API_SHARED_SECRET
 
 
 def ensure_config() -> dict:
     config = load_config()
-    save_config(config)
+    changed = False
+    if not config.get("admin_password_hash"):
+        raw_password = str(config.get("admin_password") or default_config()["admin_password"])
+        config["admin_password_hash"] = hash_password_value(raw_password)
+        config["admin_password"] = ""
+        changed = True
+    if not config.get("api_shared_secret"):
+        config["api_shared_secret"] = DEFAULT_API_SHARED_SECRET
+        changed = True
+    if changed:
+        save_config(config)
     return config
+
+
+def normalize_license_key_value(value: str) -> str:
+    return str(value or "").strip().casefold()
+
+
+def session_token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def get_admin_session_hours(config: dict | None = None) -> int:
+    active_config = config or load_config()
+    try:
+        hours = int(active_config.get("admin_session_hours", 12))
+    except Exception:
+        hours = 12
+    return max(1, min(hours, 72))
+
+
+def get_api_signature_ttl_seconds(config: dict | None = None) -> int:
+    active_config = config or load_config()
+    try:
+        ttl = int(active_config.get("api_signature_ttl_seconds", DEFAULT_API_SIGNATURE_TTL_SECONDS))
+    except Exception:
+        ttl = DEFAULT_API_SIGNATURE_TTL_SECONDS
+    return max(30, min(ttl, 900))
+
+
+def verify_admin_password(config: dict, password: str) -> bool:
+    stored_hash = str(config.get("admin_password_hash", "")).strip()
+    if stored_hash:
+        return verify_password_hash(stored_hash, password)
+    legacy_password = str(config.get("admin_password", "")).strip()
+    return bool(legacy_password) and hmac.compare_digest(legacy_password, password)
+
+
+def cleanup_login_attempts(ip: str = "") -> None:
+    cutoff = time.time() - LOGIN_ATTEMPT_WINDOW_SECONDS
+    for candidate_ip in list(LOGIN_ATTEMPTS.keys()):
+        attempts = [value for value in LOGIN_ATTEMPTS.get(candidate_ip, []) if value >= cutoff]
+        if attempts:
+            LOGIN_ATTEMPTS[candidate_ip] = attempts
+        else:
+            LOGIN_ATTEMPTS.pop(candidate_ip, None)
+    if ip and ip not in LOGIN_ATTEMPTS:
+        LOGIN_ATTEMPTS[ip] = []
+
+
+def is_login_rate_limited(ip: str) -> bool:
+    cleanup_login_attempts(ip)
+    return len(LOGIN_ATTEMPTS.get(ip, [])) >= LOGIN_ATTEMPT_LIMIT
+
+
+def record_login_failure(ip: str) -> None:
+    cleanup_login_attempts(ip)
+    LOGIN_ATTEMPTS.setdefault(ip, []).append(time.time())
+
+
+def clear_login_failures(ip: str) -> None:
+    LOGIN_ATTEMPTS.pop(ip, None)
+
+
+def build_api_signature_payload(timestamp_value: str, nonce: str, body: bytes) -> bytes:
+    return (
+        timestamp_value.encode("utf-8")
+        + b"\n"
+        + nonce.encode("utf-8")
+        + b"\n"
+        + body
+    )
+
+
+def compute_api_signature(secret: str, timestamp_value: str, nonce: str, body: bytes) -> str:
+    payload = build_api_signature_payload(timestamp_value, nonce, body)
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def register_api_nonce(db: dict, nonce: str) -> None:
+    db.setdefault("api_nonces", {})[nonce] = iso_utc(now_utc())
+
+
+def build_callback_token(chat_id: int, payload: str, *, admin_only: bool = False, ttl_seconds: int = 600) -> str:
+    token = secrets.token_hex(8)
+    expires_at = now_utc() + timedelta(seconds=max(30, ttl_seconds))
+    with TELEGRAM_CALLBACK_LOCK:
+        for existing_token, item in list(TELEGRAM_CALLBACK_TOKENS.items()):
+            try:
+                if parse_iso_utc(str(item.get("expires_at", ""))) <= now_utc():
+                    TELEGRAM_CALLBACK_TOKENS.pop(existing_token, None)
+            except Exception:
+                TELEGRAM_CALLBACK_TOKENS.pop(existing_token, None)
+        TELEGRAM_CALLBACK_TOKENS[token] = {
+            "chat_id": int(chat_id),
+            "payload": payload,
+            "admin_only": bool(admin_only),
+            "expires_at": iso_utc(expires_at),
+        }
+    return f"cb:{token}"
+
+
+def resolve_callback_token(chat_id: int, raw_data: str, config: dict) -> str | None:
+    if not raw_data.startswith("cb:"):
+        if raw_data.startswith("admin:"):
+            log_security_event(
+                "telegram_unsigned_admin_callback",
+                source="telegram",
+                user_id=chat_id,
+                details="Unsigned admin callback was rejected",
+                extra={"callback_data": raw_data},
+            )
+            return None
+        return raw_data
+
+    token = raw_data[3:]
+    with TELEGRAM_CALLBACK_LOCK:
+        entry = TELEGRAM_CALLBACK_TOKENS.pop(token, None)
+    if not entry:
+        log_security_event(
+            "telegram_callback_missing",
+            source="telegram",
+            user_id=chat_id,
+            details="Callback token missing or already used",
+        )
+        return None
+    try:
+        if parse_iso_utc(str(entry.get("expires_at", ""))) <= now_utc():
+            raise ValueError("expired")
+    except Exception:
+        log_security_event(
+            "telegram_callback_expired",
+            source="telegram",
+            user_id=chat_id,
+            details="Callback token expired",
+        )
+        return None
+    if int(entry.get("chat_id", 0)) != int(chat_id):
+        log_security_event(
+            "telegram_callback_chat_mismatch",
+            source="telegram",
+            user_id=chat_id,
+            details="Callback token used from another chat",
+        )
+        return None
+    if entry.get("admin_only") and not is_telegram_admin(config, chat_id):
+        log_security_event(
+            "telegram_admin_callback_denied",
+            source="telegram",
+            user_id=chat_id,
+            details="Non-admin attempted to use admin callback",
+        )
+        return None
+    return str(entry.get("payload", ""))
 
 
 def find_license(db: dict, license_key: str) -> dict | None:
     for item in db.get("licenses", []):
-        if item["license_key"] == license_key:
+        if normalize_license_key_value(item.get("license_key", "")) == normalize_license_key_value(license_key):
             return item
     return None
 
@@ -131,136 +515,154 @@ def append_auth_log(db: dict, license_key: str, product: str, hwid: str, ip: str
     db["auth_logs"] = db["auth_logs"][-300:]
 
 
+def detach_license_from_users(license_key: str) -> None:
+    data = load_users()
+    changed = False
+    normalized_key = normalize_license_key_value(license_key)
+    for user in data.setdefault("users", {}).values():
+        if normalize_license_key_value(user.get("license_key", "")) == normalized_key:
+            user["license_key"] = ""
+            changed = True
+    if changed:
+        save_users(data)
+
+
 def validate_license(license_key: str, hwid: str, product: str, ip: str) -> dict:
-    db = load_db()
-    item = find_license(db, license_key)
-    if not item:
-        result = {"success": False, "message": "License not found"}
-        append_auth_log(db, license_key, product, hwid, ip, False, result["message"])
+    with STORAGE_LOCK:
+        db = load_db()
+        item = find_license(db, license_key)
+        if not item:
+            result = {"success": False, "message": "License not found"}
+            append_auth_log(db, license_key, product, hwid, ip, False, result["message"])
+            save_db(db)
+            return result
+
+        if str(item.get("product", "")).strip().casefold() != str(product).strip().casefold():
+            result = {"success": False, "message": "Wrong product"}
+            append_auth_log(db, license_key, product, hwid, ip, False, result["message"])
+            save_db(db)
+            return result
+
+        status = normalize_status(item)
+        if status == "frozen":
+            result = {"success": False, "message": "License frozen"}
+            append_auth_log(db, license_key, product, hwid, ip, False, result["message"])
+            save_db(db)
+            return result
+        if status != "active":
+            result = {"success": False, "message": f"License status is {status}"}
+            append_auth_log(db, license_key, product, hwid, ip, False, result["message"])
+            save_db(db)
+            return result
+
+        expires_at = parse_iso_utc(item["expires_at"])
+        if now_utc() > expires_at:
+            item["status"] = "expired"
+            result = {"success": False, "message": "License expired", "expires_at": item["expires_at"]}
+            append_auth_log(db, license_key, product, hwid, ip, False, result["message"])
+            save_db(db)
+            return result
+
+        bound_hwid = item.get("hwid", "")
+        if bound_hwid and bound_hwid != hwid:
+            result = {"success": False, "message": "HWID mismatch"}
+            append_auth_log(db, license_key, product, hwid, ip, False, result["message"])
+            save_db(db)
+            return result
+
+        if not bound_hwid:
+            item["hwid"] = hwid
+
+        item["max_users"] = 1
+        item["last_seen_at"] = iso_utc(now_utc())
+        item["last_ip"] = ip
+        append_auth_log(db, license_key, product, hwid, ip, True, "License valid")
         save_db(db)
-        return result
 
-    if item.get("product") != product:
-        result = {"success": False, "message": "Wrong product"}
-        append_auth_log(db, license_key, product, hwid, ip, False, result["message"])
-        save_db(db)
-        return result
-
-    status = normalize_status(item)
-    if status == "frozen":
-        result = {"success": False, "message": "License frozen"}
-        append_auth_log(db, license_key, product, hwid, ip, False, result["message"])
-        save_db(db)
-        return result
-    if status != "active":
-        result = {"success": False, "message": f"License status is {status}"}
-        append_auth_log(db, license_key, product, hwid, ip, False, result["message"])
-        save_db(db)
-        return result
-
-    expires_at = parse_iso_utc(item["expires_at"])
-    if now_utc() > expires_at:
-        item["status"] = "expired"
-        result = {"success": False, "message": "License expired", "expires_at": item["expires_at"]}
-        append_auth_log(db, license_key, product, hwid, ip, False, result["message"])
-        save_db(db)
-        return result
-
-    bound_hwid = item.get("hwid", "")
-    if bound_hwid and bound_hwid != hwid:
-        result = {"success": False, "message": "HWID mismatch"}
-        append_auth_log(db, license_key, product, hwid, ip, False, result["message"])
-        save_db(db)
-        return result
-
-    if not bound_hwid:
-        item["hwid"] = hwid
-
-    item["max_users"] = 1
-    item["last_seen_at"] = iso_utc(now_utc())
-    item["last_ip"] = ip
-    append_auth_log(db, license_key, product, hwid, ip, True, "License valid")
-    save_db(db)
-
-    remaining_seconds = max(0, int((expires_at - now_utc()).total_seconds()))
-    return {
-        "success": True,
-        "message": "License valid",
-        "name": item.get("name", ""),
-        "expires_at": item["expires_at"],
-        "days_left": remaining_seconds // 86400,
-        "bound_hwid": item.get("hwid", ""),
-        "status": "active",
-        "max_users": 1,
-        "notes": item.get("notes", ""),
-        "last_ip": item.get("last_ip", ""),
-    }
+        remaining_seconds = max(0, int((expires_at - now_utc()).total_seconds()))
+        return {
+            "success": True,
+            "message": "License valid",
+            "name": item.get("name", ""),
+            "expires_at": item["expires_at"],
+            "days_left": remaining_seconds // 86400,
+            "bound_hwid": item.get("hwid", ""),
+            "status": "active",
+            "max_users": 1,
+            "notes": item.get("notes", ""),
+            "last_ip": item.get("last_ip", ""),
+        }
 
 
 def create_license_record(key: str, name: str, days: int, product: str, notes: str) -> dict:
-    db = load_db()
-    if find_license(db, key):
-        raise ValueError("License already exists")
+    with STORAGE_LOCK:
+        db = load_db()
+        if find_license(db, key):
+            raise ValueError("License already exists")
 
-    item = {
-        "license_key": key,
-        "name": name,
-        "product": product,
-        "expires_at": iso_utc(now_utc() + timedelta(days=days)),
-        "status": "active",
-        "hwid": "",
-        "notes": notes or "",
-        "created_at": iso_utc(now_utc()),
-        "last_seen_at": "",
-        "max_users": 1,
-    }
-    db.setdefault("licenses", []).append(item)
-    save_db(db)
-    return item
+        item = {
+            "license_key": key.strip(),
+            "name": name,
+            "product": product,
+            "expires_at": iso_utc(now_utc() + timedelta(days=days)),
+            "status": "active",
+            "hwid": "",
+            "notes": notes or "",
+            "created_at": iso_utc(now_utc()),
+            "last_seen_at": "",
+            "max_users": 1,
+        }
+        db.setdefault("licenses", []).append(item)
+        save_db(db)
+        return deepcopy(item)
 
 
 def freeze_license_record(key: str) -> dict:
-    db = load_db()
-    item = find_license(db, key)
-    if not item:
-        raise ValueError("License not found")
-    item["status"] = "frozen"
-    save_db(db)
-    return deepcopy(item)
+    with STORAGE_LOCK:
+        db = load_db()
+        item = find_license(db, key)
+        if not item:
+            raise ValueError("License not found")
+        item["status"] = "frozen"
+        save_db(db)
+        return deepcopy(item)
 
 
 def unfreeze_license_record(key: str) -> dict:
-    db = load_db()
-    item = find_license(db, key)
-    if not item:
-        raise ValueError("License not found")
-    item["status"] = "active"
-    save_db(db)
-    return deepcopy(item)
+    with STORAGE_LOCK:
+        db = load_db()
+        item = find_license(db, key)
+        if not item:
+            raise ValueError("License not found")
+        item["status"] = "active"
+        save_db(db)
+        return deepcopy(item)
 
 
 def extend_license_record(key: str, days: int) -> dict:
-    db = load_db()
-    item = find_license(db, key)
-    if not item:
-        raise ValueError("License not found")
-    base = parse_iso_utc(item["expires_at"])
-    if now_utc() > base:
-        base = now_utc()
-    item["expires_at"] = iso_utc(base + timedelta(days=days))
-    item["status"] = "active"
-    save_db(db)
-    return deepcopy(item)
+    with STORAGE_LOCK:
+        db = load_db()
+        item = find_license(db, key)
+        if not item:
+            raise ValueError("License not found")
+        base = parse_iso_utc(item["expires_at"])
+        if now_utc() > base:
+            base = now_utc()
+        item["expires_at"] = iso_utc(base + timedelta(days=days))
+        item["status"] = "active"
+        save_db(db)
+        return deepcopy(item)
 
 
 def reset_hwid_record(key: str) -> dict:
-    db = load_db()
-    item = find_license(db, key)
-    if not item:
-        raise ValueError("License not found")
-    item["hwid"] = ""
-    save_db(db)
-    return deepcopy(item)
+    with STORAGE_LOCK:
+        db = load_db()
+        item = find_license(db, key)
+        if not item:
+            raise ValueError("License not found")
+        item["hwid"] = ""
+        save_db(db)
+        return deepcopy(item)
 
 
 def show_license_record(key: str) -> dict:
@@ -294,12 +696,18 @@ def search_license_records(query: str, limit: int = 20) -> list[dict]:
 
 
 def delete_license_record(key: str) -> None:
-    db = load_db()
-    before = len(db.get("licenses", []))
-    db["licenses"] = [item for item in db.get("licenses", []) if item.get("license_key") != key]
-    if len(db["licenses"]) == before:
-        raise ValueError("License not found")
-    save_db(db)
+    with STORAGE_LOCK:
+        db = load_db()
+        before = len(db.get("licenses", []))
+        normalized_key = normalize_license_key_value(key)
+        db["licenses"] = [
+            item for item in db.get("licenses", [])
+            if normalize_license_key_value(item.get("license_key", "")) != normalized_key
+        ]
+        if len(db["licenses"]) == before:
+            raise ValueError("License not found")
+        save_db(db)
+    detach_license_from_users(key)
 
 
 def list_license_records(limit: int = 20) -> list[dict]:
@@ -316,29 +724,96 @@ def days_left_for_item(item: dict) -> int:
 
 
 def set_license_days_left(key: str, days: int) -> dict:
-    db = load_db()
-    item = find_license(db, key)
-    if not item:
-        raise ValueError("License not found")
-    item["expires_at"] = iso_utc(now_utc() + timedelta(days=max(0, days)))
-    item["status"] = "active" if days > 0 else "expired"
-    save_db(db)
-    return deepcopy(item)
+    with STORAGE_LOCK:
+        db = load_db()
+        item = find_license(db, key)
+        if not item:
+            raise ValueError("License not found")
+        item["expires_at"] = iso_utc(now_utc() + timedelta(days=max(0, days)))
+        item["status"] = "active" if days > 0 else "expired"
+        save_db(db)
+        return deepcopy(item)
 
 
 def update_license_record(key: str, *, name: str | None = None, product: str | None = None, notes: str | None = None) -> dict:
-    db = load_db()
-    item = find_license(db, key)
-    if not item:
-        raise ValueError("License not found")
-    if name is not None:
-        item["name"] = name
-    if product is not None:
-        item["product"] = product
-    if notes is not None:
-        item["notes"] = notes
-    save_db(db)
-    return deepcopy(item)
+    with STORAGE_LOCK:
+        db = load_db()
+        item = find_license(db, key)
+        if not item:
+            raise ValueError("License not found")
+        if name is not None:
+            item["name"] = name
+        if product is not None:
+            item["product"] = product
+        if notes is not None:
+            item["notes"] = notes
+        save_db(db)
+        return deepcopy(item)
+
+
+def normalize_subject_identifier(value: str) -> str:
+    return normalize_license_key_value(str(value or "").lstrip("@"))
+
+
+def apply_requested_key_updates() -> dict:
+    photo_keys = [
+        "Emmanuel_1986",
+        "Maksimkakiber219",
+        "vladpukaet332",
+        "Zetry",
+        "vidoddogo",
+        "xuronix",
+        "lycyf",
+        "@im_Fos4k",
+        "@yymad1417",
+        "@FroziTelegram",
+        "@durovooooo",
+        "@grigoruck",
+        "@hcoder0",
+        "@Awemyn",
+        "@dotrect",
+        "@Seks_smg",
+        "@Vasag1337",
+    ]
+    expired_photo_keys = {"seks_smg", "vasag1337"}
+    created_keys: list[str] = []
+    changed_keys: list[str] = []
+
+    with STORAGE_LOCK:
+        db = load_db()
+        active_expires_at = iso_utc(now_utc() + timedelta(days=14))
+        expired_at = iso_utc(now_utc() - timedelta(minutes=1))
+        for key in photo_keys:
+            is_expired_key = normalize_subject_identifier(key) in expired_photo_keys
+            item = find_license(db, key)
+            if not item:
+                item = {
+                    "license_key": key,
+                    "name": "Media",
+                    "product": "Private cheat",
+                    "expires_at": expired_at if is_expired_key else active_expires_at,
+                    "status": "expired" if is_expired_key else "active",
+                    "hwid": "",
+                    "notes": "",
+                    "created_at": iso_utc(now_utc()),
+                    "last_seen_at": "",
+                    "max_users": 1,
+                }
+                db.setdefault("licenses", []).append(item)
+                created_keys.append(key)
+            item["name"] = "Media"
+            item["product"] = "Private cheat"
+            item["expires_at"] = expired_at if is_expired_key else active_expires_at
+            item["status"] = "expired" if is_expired_key else "active"
+            item["max_users"] = 1
+            changed_keys.append(key)
+        save_db(db)
+
+    return {
+        "created_keys": created_keys,
+        "changed_keys": changed_keys,
+        "total_remaining": len(load_db().get("licenses", [])),
+    }
 
 
 def format_license_line(item: dict) -> str:
@@ -356,11 +831,11 @@ def format_license_details(item: dict) -> str:
         f"👤 Name: {item.get('name', '-')}\n"
         f"📦 Product: {item.get('product', '-')}\n"
         f"📌 Status: {item.get('status', '-')}\n"
-        f"📅 Expires: {item.get('expires_at', '-')}\n"
+        f"📅 Expires: {format_admin_datetime(item.get('expires_at', ''))}\n"
         f"⏳ Days Left: {days_left_for_item(item)}\n"
         f"🖥 HWID: {item.get('hwid') or '-'}\n"
         f"🌐 Last IP: {item.get('last_ip') or '-'}\n"
-        f"🕒 Last Seen: {item.get('last_seen_at') or '-'}\n"
+        f"🕒 Last Seen: {format_admin_datetime(item.get('last_seen_at', ''))}\n"
         f"📝 Notes: {item.get('notes') or '-'}"
     )
 
@@ -381,12 +856,16 @@ def format_admin_datetime(value: str) -> str:
     if not value:
         return "-"
     try:
-        return parse_iso_utc(value).strftime("%d.%m.%Y %H:%M UTC")
+        return parse_iso_utc(value).astimezone(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M МСК")
     except Exception:
         return value
 
 
-def render_license_card_html(item: dict) -> str:
+def csrf_hidden_input(token: str) -> str:
+    return f'<input type="hidden" name="csrf_token" value="{html.escape(token)}">'
+
+
+def render_license_card_html(item: dict, csrf_token: str) -> str:
     status = display_status(item)
     key_value = item.get("license_key", "")
     return f"""
@@ -432,21 +911,25 @@ def render_license_card_html(item: dict) -> str:
   </div>
   <div class="license-actions">
     <form method="post" action="/admin/action" class="inline">
+      {csrf_hidden_input(csrf_token)}
       <input type="hidden" name="action" value="freeze">
       <input type="hidden" name="key" value="{html.escape(key_value)}">
       <button class="btn warn small" type="submit">Freeze</button>
     </form>
     <form method="post" action="/admin/action" class="inline">
+      {csrf_hidden_input(csrf_token)}
       <input type="hidden" name="action" value="unfreeze">
       <input type="hidden" name="key" value="{html.escape(key_value)}">
       <button class="btn small" type="submit">Unfreeze</button>
     </form>
     <form method="post" action="/admin/action" class="inline">
+      {csrf_hidden_input(csrf_token)}
       <input type="hidden" name="action" value="reset_hwid">
       <input type="hidden" name="key" value="{html.escape(key_value)}">
       <button class="btn alt small" type="submit">Reset HWID</button>
     </form>
     <form method="post" action="/admin/action" class="inline">
+      {csrf_hidden_input(csrf_token)}
       <input type="hidden" name="action" value="delete">
       <input type="hidden" name="key" value="{html.escape(key_value)}">
       <button class="btn bad small" type="submit">Delete</button>
@@ -493,35 +976,35 @@ TELEGRAM_CHAT_STATES: dict[int, dict] = {}
 
 def is_single_admin(config: dict, chat_id: int) -> bool:
     admin_ids = [str(item) for item in config.get("telegram_admin_chat_ids", [])]
-    return bool(admin_ids) and str(chat_id) == admin_ids[0]
+    return bool(admin_ids) and str(chat_id) in admin_ids
 
 
-def cb(data: str) -> str:
-    return data[:64]
+def cb(chat_id: int, data: str, *, admin_only: bool = False) -> str:
+    return build_callback_token(chat_id, data, admin_only=admin_only)
 
 
-def telegram_user_keyboard() -> dict:
+def telegram_user_keyboard(chat_id: int) -> dict:
     return {
         "inline_keyboard": [
-            [{"text": BTN_PROFILE, "callback_data": cb("user:profile")}, {"text": BTN_MY_KEY, "callback_data": cb("user:key")}],
-            [{"text": BTN_SUPPORT, "callback_data": cb("user:support")}, {"text": BTN_INFO, "callback_data": cb("user:info")}],
+            [{"text": BTN_PROFILE, "callback_data": cb(chat_id, "user:profile")}, {"text": BTN_MY_KEY, "callback_data": cb(chat_id, "user:key")}],
+            [{"text": BTN_SUPPORT, "callback_data": cb(chat_id, "user:support")}, {"text": BTN_INFO, "callback_data": cb(chat_id, "user:info")}],
         ]
     }
 
 
-def telegram_admin_keyboard() -> dict:
+def telegram_admin_keyboard(chat_id: int) -> dict:
     return {
         "inline_keyboard": [
-            [{"text": BTN_ADMIN_CREATE, "callback_data": cb("admin:create")}, {"text": BTN_ADMIN_LIST, "callback_data": cb("admin:list")}],
-            [{"text": BTN_ADMIN_SHOW, "callback_data": cb("admin:find")}, {"text": BTN_ADMIN_STATS, "callback_data": cb("admin:stats")}],
-            [{"text": BTN_ADMIN_EXIT, "callback_data": cb("admin:exit")}],
+            [{"text": BTN_ADMIN_CREATE, "callback_data": cb(chat_id, "admin:create", admin_only=True)}, {"text": BTN_ADMIN_LIST, "callback_data": cb(chat_id, "admin:list", admin_only=True)}],
+            [{"text": BTN_ADMIN_SHOW, "callback_data": cb(chat_id, "admin:find", admin_only=True)}, {"text": BTN_ADMIN_STATS, "callback_data": cb(chat_id, "admin:stats", admin_only=True)}],
+            [{"text": BTN_ADMIN_EXIT, "callback_data": cb(chat_id, "admin:exit", admin_only=True)}],
         ]
     }
 
 
-def telegram_cancel_keyboard(admin: bool) -> dict:
+def telegram_cancel_keyboard(chat_id: int, admin: bool) -> dict:
     return {
-        "inline_keyboard": [[{"text": BTN_CANCEL, "callback_data": cb("admin:exit" if admin else "user:menu")}]]
+        "inline_keyboard": [[{"text": BTN_CANCEL, "callback_data": cb(chat_id, "admin:exit" if admin else "user:menu", admin_only=admin)}]]
     }
 
 
@@ -546,7 +1029,7 @@ def update_telegram_user_license(chat_id: int, license_key: str) -> None:
     data = load_users()
     users = data.setdefault("users", {})
     for existing_chat_id, existing_user in users.items():
-        if str(existing_chat_id) != str(chat_id) and str(existing_user.get("license_key", "")).strip() == license_key:
+        if str(existing_chat_id) != str(chat_id) and normalize_license_key_value(existing_user.get("license_key", "")) == normalize_license_key_value(license_key):
             raise ValueError("Этот ключ уже привязан к другому Telegram аккаунту")
     user = users.setdefault(str(chat_id), {
         "chat_id": chat_id,
@@ -599,7 +1082,7 @@ def telegram_profile_text(chat_id: int) -> str:
         try:
             item = show_license_record(license_key)
             lines.append(f"📌 Status: {item.get('status', '-')}")
-            lines.append(f"📅 Expires: {item.get('expires_at', '-')}")
+            lines.append(f"📅 Expires: {format_admin_datetime(item.get('expires_at', ''))}")
         except ValueError:
             lines.append("⚠️ Status: key not found")
     return "\n".join(lines)
@@ -641,35 +1124,35 @@ def telegram_stats_text() -> str:
     )
 
 
-def license_list_keyboard(items: list[dict], mode: str) -> dict:
+def license_list_keyboard(items: list[dict], mode: str, chat_id: int) -> dict:
     rows = []
     for item in items[:12]:
-        rows.append([{"text": item.get("license_key", "-"), "callback_data": cb(f"{mode}:key:{item.get('license_key', '')}")}])
-    rows.append([{"text": "🔎 Найти вручную", "callback_data": cb(f"{mode}:manual")}])
+        rows.append([{"text": item.get("license_key", "-"), "callback_data": cb(chat_id, f"{mode}:key:{item.get('license_key', '')}", admin_only=(mode == "admin"))}])
+    rows.append([{"text": "🔎 Найти вручную", "callback_data": cb(chat_id, f"{mode}:manual", admin_only=(mode == "admin"))}])
     if mode == "admin":
-        rows.append([{"text": "⬅️ Назад", "callback_data": cb("admin:menu")}])
+        rows.append([{"text": "⬅️ Назад", "callback_data": cb(chat_id, "admin:menu", admin_only=True)}])
     else:
-        rows.append([{"text": "⬅️ Назад", "callback_data": cb("user:menu")}])
+        rows.append([{"text": "⬅️ Назад", "callback_data": cb(chat_id, "user:menu")}])
     return {"inline_keyboard": rows}
 
 
-def admin_key_actions_keyboard(key: str) -> dict:
+def admin_key_actions_keyboard(key: str, chat_id: int) -> dict:
     return {
         "inline_keyboard": [
-            [{"text": BTN_ADMIN_FREEZE, "callback_data": cb(f"admin:freeze:{key}")}, {"text": BTN_ADMIN_UNFREEZE, "callback_data": cb(f"admin:unfreeze:{key}")}],
-            [{"text": BTN_ADMIN_EXTEND, "callback_data": cb(f"admin:extend:{key}")}, {"text": BTN_ADMIN_RESET, "callback_data": cb(f"admin:reset:{key}")}],
-            [{"text": "✏️ Редактировать", "callback_data": cb(f"admin:edit:{key}")}, {"text": BTN_ADMIN_DELETE, "callback_data": cb(f"admin:delete:{key}")}],
-            [{"text": "⬅️ Назад к списку", "callback_data": cb("admin:list")}],
+            [{"text": BTN_ADMIN_FREEZE, "callback_data": cb(chat_id, f"admin:freeze:{key}", admin_only=True)}, {"text": BTN_ADMIN_UNFREEZE, "callback_data": cb(chat_id, f"admin:unfreeze:{key}", admin_only=True)}],
+            [{"text": BTN_ADMIN_EXTEND, "callback_data": cb(chat_id, f"admin:extend:{key}", admin_only=True)}, {"text": BTN_ADMIN_RESET, "callback_data": cb(chat_id, f"admin:reset:{key}", admin_only=True)}],
+            [{"text": "✏️ Редактировать", "callback_data": cb(chat_id, f"admin:edit:{key}", admin_only=True)}, {"text": BTN_ADMIN_DELETE, "callback_data": cb(chat_id, f"admin:delete:{key}", admin_only=True)}],
+            [{"text": "⬅️ Назад к списку", "callback_data": cb(chat_id, "admin:list", admin_only=True)}],
         ]
     }
 
 
-def admin_edit_keyboard(key: str) -> dict:
+def admin_edit_keyboard(key: str, chat_id: int) -> dict:
     return {
         "inline_keyboard": [
-            [{"text": "✏️ Имя", "callback_data": cb(f"admin:edit_name:{key}")}, {"text": "📦 Product", "callback_data": cb(f"admin:edit_product:{key}")}],
-            [{"text": "📝 Notes", "callback_data": cb(f"admin:edit_notes:{key}")}, {"text": "📅 Дней осталось", "callback_data": cb(f"admin:edit_days:{key}")}],
-            [{"text": "⬅️ К карточке ключа", "callback_data": cb(f"admin:key:{key}")}],
+            [{"text": "✏️ Имя", "callback_data": cb(chat_id, f"admin:edit_name:{key}", admin_only=True)}, {"text": "📦 Product", "callback_data": cb(chat_id, f"admin:edit_product:{key}", admin_only=True)}],
+            [{"text": "📝 Notes", "callback_data": cb(chat_id, f"admin:edit_notes:{key}", admin_only=True)}, {"text": "📅 Дней осталось", "callback_data": cb(chat_id, f"admin:edit_days:{key}", admin_only=True)}],
+            [{"text": "⬅️ К карточке ключа", "callback_data": cb(chat_id, f"admin:key:{key}", admin_only=True)}],
         ]
     }
 
@@ -688,7 +1171,7 @@ def start_telegram_action(chat_id: int, action: str, admin: bool, key: str = "")
         "admin_edit_notes": "Введите новые notes",
         "admin_edit_days": "Введите сколько дней должно остаться",
     }
-    return {"text": prompts[action], "reply_markup": telegram_cancel_keyboard(admin)}
+    return {"text": prompts[action], "reply_markup": telegram_cancel_keyboard(chat_id, admin)}
 
 
 def finish_telegram_action(chat_id: int) -> None:
@@ -698,19 +1181,29 @@ def finish_telegram_action(chat_id: int) -> None:
 def main_keyboard_for(chat_id: int) -> dict:
     state = TELEGRAM_CHAT_STATES.get(chat_id)
     if state and state.get("admin"):
-        return telegram_admin_keyboard()
-    return telegram_user_keyboard()
+        return telegram_admin_keyboard(chat_id)
+    return telegram_user_keyboard(chat_id)
 
 
 def process_telegram_state(chat_id: int, text: str) -> dict | None:
     state = TELEGRAM_CHAT_STATES.get(chat_id)
     if not state:
         return None
+    config = load_config()
+    if state.get("admin") and not is_telegram_admin(config, chat_id):
+        finish_telegram_action(chat_id)
+        log_security_event(
+            "telegram_admin_state_denied",
+            source="telegram",
+            user_id=chat_id,
+            details="Non-admin user attempted to continue admin state flow",
+        )
+        return {"text": "⛔ Нет доступа", "reply_markup": telegram_user_keyboard(chat_id)}
 
     if text == BTN_CANCEL:
         admin = bool(state.get("admin"))
         finish_telegram_action(chat_id)
-        return {"text": "↩️ Действие отменено", "reply_markup": telegram_admin_keyboard() if admin else telegram_user_keyboard()}
+        return {"text": "↩️ Действие отменено", "reply_markup": telegram_admin_keyboard(chat_id) if admin else telegram_user_keyboard(chat_id)}
 
     action = state["action"]
     step = state["step"]
@@ -721,72 +1214,72 @@ def process_telegram_state(chat_id: int, text: str) -> dict | None:
             item = show_license_record(text)
             update_telegram_user_license(chat_id, item["license_key"])
             finish_telegram_action(chat_id)
-            return {"text": "✅ Ключ привязан\n\n" + format_license_details(item), "reply_markup": telegram_user_keyboard()}
+            return {"text": "✅ Ключ привязан\n\n" + format_license_details(item), "reply_markup": telegram_user_keyboard(chat_id)}
 
         if action == "admin_create":
             if step == "start":
                 data["key"] = text
                 state["step"] = "name"
-                return {"text": "Введите name", "reply_markup": telegram_cancel_keyboard(True)}
+                return {"text": "Введите name", "reply_markup": telegram_cancel_keyboard(chat_id, True)}
             if step == "name":
                 data["name"] = text
                 state["step"] = "product"
-                return {"text": "Введите product", "reply_markup": telegram_cancel_keyboard(True)}
+                return {"text": "Введите product", "reply_markup": telegram_cancel_keyboard(chat_id, True)}
             if step == "product":
                 data["product"] = text
                 state["step"] = "days"
-                return {"text": "Введите days", "reply_markup": telegram_cancel_keyboard(True)}
+                return {"text": "Введите days", "reply_markup": telegram_cancel_keyboard(chat_id, True)}
             if step == "days":
                 data["days"] = int(text)
                 state["step"] = "notes"
-                return {"text": "Введите notes или '-' для пропуска", "reply_markup": telegram_cancel_keyboard(True)}
+                return {"text": "Введите notes или '-' для пропуска", "reply_markup": telegram_cancel_keyboard(chat_id, True)}
             if step == "notes":
                 notes = "" if text == "-" else text
                 item = create_license_record(data["key"], data["name"], data["days"], data["product"], notes)
                 finish_telegram_action(chat_id)
-                return {"text": "✅ Ключ создан\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item['license_key'])}
+                return {"text": "✅ Ключ создан\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item['license_key'], chat_id)}
 
         if action == "admin_manual_show":
             item = show_license_record(text)
             finish_telegram_action(chat_id)
-            return {"text": "🔎 Информация о ключе\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"])}
+            return {"text": "🔎 Информация о ключе\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"], chat_id)}
 
         if action == "admin_extend":
             item = extend_license_record(data["key"], int(text))
             finish_telegram_action(chat_id)
-            return {"text": "✅ Ключ продлен\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"])}
+            return {"text": "✅ Ключ продлен\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"], chat_id)}
 
         if action == "admin_edit_name":
             item = update_license_record(data["key"], name=text)
             finish_telegram_action(chat_id)
-            return {"text": "✏️ Имя обновлено\n\n" + format_license_details(item), "reply_markup": admin_edit_keyboard(item["license_key"])}
+            return {"text": "✏️ Имя обновлено\n\n" + format_license_details(item), "reply_markup": admin_edit_keyboard(item["license_key"], chat_id)}
 
         if action == "admin_edit_product":
             item = update_license_record(data["key"], product=text)
             finish_telegram_action(chat_id)
-            return {"text": "📦 Product обновлен\n\n" + format_license_details(item), "reply_markup": admin_edit_keyboard(item["license_key"])}
+            return {"text": "📦 Product обновлен\n\n" + format_license_details(item), "reply_markup": admin_edit_keyboard(item["license_key"], chat_id)}
 
         if action == "admin_edit_notes":
             item = update_license_record(data["key"], notes="" if text == "-" else text)
             finish_telegram_action(chat_id)
-            return {"text": "📝 Notes обновлены\n\n" + format_license_details(item), "reply_markup": admin_edit_keyboard(item["license_key"])}
+            return {"text": "📝 Notes обновлены\n\n" + format_license_details(item), "reply_markup": admin_edit_keyboard(item["license_key"], chat_id)}
 
         if action == "admin_edit_days":
             item = set_license_days_left(data["key"], int(text))
             finish_telegram_action(chat_id)
-            return {"text": "📅 Срок обновлен\n\n" + format_license_details(item), "reply_markup": admin_edit_keyboard(item["license_key"])}
+            return {"text": "📅 Срок обновлен\n\n" + format_license_details(item), "reply_markup": admin_edit_keyboard(item["license_key"], chat_id)}
     except ValueError as exc:
         admin = bool(state.get("admin"))
         finish_telegram_action(chat_id)
-        return {"text": f"⚠️ {exc}", "reply_markup": telegram_admin_keyboard() if admin else telegram_user_keyboard()}
+        return {"text": f"⚠️ {exc}", "reply_markup": telegram_admin_keyboard(chat_id) if admin else telegram_user_keyboard(chat_id)}
     except Exception as exc:
         admin = bool(state.get("admin"))
         finish_telegram_action(chat_id)
-        return {"text": f"❌ Error: {exc}", "reply_markup": telegram_admin_keyboard() if admin else telegram_user_keyboard()}
+        return {"text": f"❌ Error: {exc}", "reply_markup": telegram_admin_keyboard(chat_id) if admin else telegram_user_keyboard(chat_id)}
 
     admin = bool(state.get("admin"))
     finish_telegram_action(chat_id)
-    return {"text": "❓ Неизвестное состояние", "reply_markup": telegram_admin_keyboard() if admin else telegram_user_keyboard()}
+    return {"text": "❓ Неизвестное состояние", "reply_markup": telegram_admin_keyboard(chat_id) if admin else telegram_user_keyboard(chat_id)}
 
 
 def telegram_api(config: dict, method: str, payload: dict) -> dict:
@@ -859,71 +1352,81 @@ def bind_telegram_admin(chat_id: int) -> None:
 def handle_telegram_callback(chat_id: int, username: str, full_name: str, data: str) -> dict:
     config = load_config()
     get_or_create_telegram_user(chat_id, username, full_name)
+    data = resolve_callback_token(chat_id, data, config)
+    if not data:
+        return {"text": "⛔ Кнопка устарела или недоступна", "reply_markup": main_keyboard_for(chat_id)}
 
     if data == "user:menu":
         finish_telegram_action(chat_id)
-        return {"text": telegram_user_welcome_text(), "reply_markup": telegram_user_keyboard()}
+        return {"text": telegram_user_welcome_text(), "reply_markup": telegram_user_keyboard(chat_id)}
     if data == "user:profile":
-        return {"text": telegram_profile_text(chat_id), "reply_markup": telegram_user_keyboard()}
+        return {"text": telegram_profile_text(chat_id), "reply_markup": telegram_user_keyboard(chat_id)}
     if data == "user:support":
-        return {"text": telegram_support_text(config), "reply_markup": telegram_user_keyboard()}
+        return {"text": telegram_support_text(config), "reply_markup": telegram_user_keyboard(chat_id)}
     if data == "user:info":
-        return {"text": telegram_info_text(config), "reply_markup": telegram_user_keyboard()}
+        return {"text": telegram_info_text(config), "reply_markup": telegram_user_keyboard(chat_id)}
     if data == "user:key":
         user = get_telegram_user(chat_id)
         if user.get("license_key"):
             try:
-                return {"text": telegram_my_key_text(chat_id), "reply_markup": telegram_user_keyboard()}
+                return {"text": telegram_my_key_text(chat_id), "reply_markup": telegram_user_keyboard(chat_id)}
             except ValueError:
                 return start_telegram_action(chat_id, "bind_my_key", False)
         return start_telegram_action(chat_id, "bind_my_key", False)
 
     if not is_single_admin(config, chat_id):
-        return {"text": "⛔ Нет доступа", "reply_markup": telegram_user_keyboard()}
+        log_security_event(
+            "telegram_admin_callback_denied",
+            source="telegram",
+            user_id=chat_id,
+            details="Non-admin callback blocked",
+            extra={"callback_data": data},
+        )
+        return {"text": "⛔ Нет доступа", "reply_markup": telegram_user_keyboard(chat_id)}
 
     if data == "admin:menu":
         finish_telegram_action(chat_id)
-        return {"text": telegram_admin_welcome_text(), "reply_markup": telegram_admin_keyboard()}
+        return {"text": telegram_admin_welcome_text(), "reply_markup": telegram_admin_keyboard(chat_id)}
     if data == "admin:exit":
         finish_telegram_action(chat_id)
-        return {"text": "🚪 Вы вышли из админки", "reply_markup": telegram_user_keyboard()}
+        return {"text": "🚪 Вы вышли из админки", "reply_markup": telegram_user_keyboard(chat_id)}
     if data == "admin:create":
         return start_telegram_action(chat_id, "admin_create", True)
     if data == "admin:list":
         items = list_license_records(20)
-        return {"text": "📭 Ключей нет" if not items else "📋 Список ключей", "reply_markup": telegram_admin_keyboard() if not items else license_list_keyboard(items, "admin")}
+        return {"text": "📭 Ключей нет" if not items else "📋 Список ключей", "reply_markup": telegram_admin_keyboard(chat_id) if not items else license_list_keyboard(items, "admin", chat_id)}
     if data == "admin:find" or data == "admin:manual":
         return start_telegram_action(chat_id, "admin_manual_show", True)
     if data == "admin:stats":
-        return {"text": telegram_stats_text(), "reply_markup": telegram_admin_keyboard()}
+        return {"text": telegram_stats_text(), "reply_markup": telegram_admin_keyboard(chat_id)}
     if data.startswith("admin:key:"):
         key = data.split(":", 2)[2]
         item = show_license_record(key)
-        return {"text": "🔎 Информация о ключе\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(key)}
+        return {"text": "🔎 Информация о ключе\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(key, chat_id)}
     if data.startswith("admin:freeze:"):
         key = data.split(":", 2)[2]
         item = freeze_license_record(key)
-        return {"text": "🧊 Ключ заморожен\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(key)}
+        return {"text": "🧊 Ключ заморожен\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(key, chat_id)}
     if data.startswith("admin:unfreeze:"):
         key = data.split(":", 2)[2]
         item = unfreeze_license_record(key)
-        return {"text": "🟢 Ключ разморожен\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(key)}
+        return {"text": "🟢 Ключ разморожен\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(key, chat_id)}
     if data.startswith("admin:reset:"):
         key = data.split(":", 2)[2]
         item = reset_hwid_record(key)
-        return {"text": "♻️ HWID сброшен\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(key)}
+        return {"text": "♻️ HWID сброшен\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(key, chat_id)}
     if data.startswith("admin:delete:"):
         key = data.split(":", 2)[2]
         delete_license_record(key)
         items = list_license_records(20)
-        return {"text": f"🗑 Ключ удален: {key}", "reply_markup": telegram_admin_keyboard() if not items else license_list_keyboard(items, "admin")}
+        return {"text": f"🗑 Ключ удален: {key}", "reply_markup": telegram_admin_keyboard(chat_id) if not items else license_list_keyboard(items, "admin", chat_id)}
     if data.startswith("admin:extend:"):
         key = data.split(":", 2)[2]
         return start_telegram_action(chat_id, "admin_extend", True, key)
     if data.startswith("admin:edit:"):
         key = data.split(":", 2)[2]
         item = show_license_record(key)
-        return {"text": "✏️ Редактирование ключа\n\n" + format_license_details(item), "reply_markup": admin_edit_keyboard(key)}
+        return {"text": "✏️ Редактирование ключа\n\n" + format_license_details(item), "reply_markup": admin_edit_keyboard(key, chat_id)}
     if data.startswith("admin:edit_name:"):
         return start_telegram_action(chat_id, "admin_edit_name", True, data.split(":", 2)[2])
     if data.startswith("admin:edit_product:"):
@@ -941,7 +1444,7 @@ def handle_telegram_command(chat_id: int, username: str, full_name: str, text: s
     get_or_create_telegram_user(chat_id, username, full_name)
     parts = text.strip().split()
     if not parts:
-        return {"text": "Пустое сообщение", "reply_markup": telegram_user_keyboard()}
+        return {"text": "Пустое сообщение", "reply_markup": telegram_user_keyboard(chat_id)}
 
     state_reply = process_telegram_state(chat_id, text)
     if state_reply is not None:
@@ -952,46 +1455,47 @@ def handle_telegram_command(chat_id: int, username: str, full_name: str, text: s
     if command == "/start":
         return {
             "text": telegram_user_welcome_text(),
-            "reply_markup": telegram_user_keyboard(),
+            "reply_markup": telegram_user_keyboard(chat_id),
             "sticker": str(config.get("user_sticker_id", "")).strip(),
         }
 
     if command == "/help":
         return {
             "text": "❓ Помощь\n\nДоступно: Профиль, Поддержка, Мой ключ, Информация.\nДля админа: /admin",
-            "reply_markup": telegram_user_keyboard(),
+            "reply_markup": telegram_user_keyboard(chat_id),
         }
 
     if text == BTN_PROFILE:
-        return {"text": telegram_profile_text(chat_id), "reply_markup": telegram_user_keyboard()}
+        return {"text": telegram_profile_text(chat_id), "reply_markup": telegram_user_keyboard(chat_id)}
 
     if text == BTN_SUPPORT:
-        return {"text": telegram_support_text(config), "reply_markup": telegram_user_keyboard()}
+        return {"text": telegram_support_text(config), "reply_markup": telegram_user_keyboard(chat_id)}
 
     if text == BTN_INFO:
-        return {"text": telegram_info_text(config), "reply_markup": telegram_user_keyboard()}
+        return {"text": telegram_info_text(config), "reply_markup": telegram_user_keyboard(chat_id)}
 
     if text == BTN_MY_KEY:
         user = get_telegram_user(chat_id)
         if user.get("license_key"):
             try:
-                return {"text": telegram_my_key_text(chat_id), "reply_markup": telegram_user_keyboard()}
+                return {"text": telegram_my_key_text(chat_id), "reply_markup": telegram_user_keyboard(chat_id)}
             except ValueError:
                 return start_telegram_action(chat_id, "bind_my_key", False)
         return start_telegram_action(chat_id, "bind_my_key", False)
 
     if command == "/admin":
         if not is_single_admin(config, chat_id):
-            return {"text": "⛔ Нет доступа", "reply_markup": telegram_user_keyboard()}
+            log_security_event("telegram_admin_command_denied", source="telegram", user_id=chat_id, details="Non-admin attempted /admin")
+            return {"text": "⛔ Нет доступа", "reply_markup": telegram_user_keyboard(chat_id)}
         finish_telegram_action(chat_id)
-        return {"text": telegram_admin_welcome_text(), "reply_markup": telegram_admin_keyboard(), "sticker": str(config.get("admin_sticker_id", "")).strip()}
+        return {"text": telegram_admin_welcome_text(), "reply_markup": telegram_admin_keyboard(chat_id), "sticker": str(config.get("admin_sticker_id", "")).strip()}
 
     if text == BTN_ADMIN_EXIT:
         finish_telegram_action(chat_id)
-        return {"text": "🚪 Вы вышли из админки", "reply_markup": telegram_user_keyboard()}
+        return {"text": "🚪 Вы вышли из админки", "reply_markup": telegram_user_keyboard(chat_id)}
 
     if not is_single_admin(config, chat_id):
-        return {"text": "📌 Используйте меню ниже", "reply_markup": telegram_user_keyboard()}
+        return {"text": "📌 Используйте меню ниже", "reply_markup": telegram_user_keyboard(chat_id)}
 
     try:
         if command == "/list":
@@ -1000,55 +1504,55 @@ def handle_telegram_command(chat_id: int, username: str, full_name: str, text: s
                 limit = max(1, min(50, int(parts[1])))
             items = list_license_records(limit)
             if not items:
-                return {"text": "📭 Ключей нет", "reply_markup": telegram_admin_keyboard()}
-            return {"text": "📋 Список ключей", "reply_markup": license_list_keyboard(items, "admin")}
+                return {"text": "📭 Ключей нет", "reply_markup": telegram_admin_keyboard(chat_id)}
+            return {"text": "📋 Список ключей", "reply_markup": license_list_keyboard(items, "admin", chat_id)}
 
         if command == "/show":
             if len(parts) != 2:
-                return {"text": "Usage: /show <key>", "reply_markup": telegram_admin_keyboard()}
+                return {"text": "Usage: /show <key>", "reply_markup": telegram_admin_keyboard(chat_id)}
             item = show_license_record(parts[1])
-            return {"text": "🔎 Информация о ключе\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"])}
+            return {"text": "🔎 Информация о ключе\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"], chat_id)}
 
         if command == "/create":
             if len(parts) < 5:
-                return {"text": "Usage: /create <key> <name> <days> <product> [notes]", "reply_markup": telegram_admin_keyboard()}
+                return {"text": "Usage: /create <key> <name> <days> <product> [notes]", "reply_markup": telegram_admin_keyboard(chat_id)}
             notes = " ".join(parts[5:]) if len(parts) > 5 else ""
             item = create_license_record(parts[1], parts[2], int(parts[3]), parts[4], notes)
-            return {"text": "✅ Created\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"])}
+            return {"text": "✅ Created\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"], chat_id)}
 
         if command == "/freeze":
             if len(parts) != 2:
-                return {"text": "Usage: /freeze <key>", "reply_markup": telegram_admin_keyboard()}
+                return {"text": "Usage: /freeze <key>", "reply_markup": telegram_admin_keyboard(chat_id)}
             item = freeze_license_record(parts[1])
-            return {"text": "🧊 Frozen\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"])}
+            return {"text": "🧊 Frozen\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"], chat_id)}
 
         if command == "/unfreeze":
             if len(parts) != 2:
-                return {"text": "Usage: /unfreeze <key>", "reply_markup": telegram_admin_keyboard()}
+                return {"text": "Usage: /unfreeze <key>", "reply_markup": telegram_admin_keyboard(chat_id)}
             item = unfreeze_license_record(parts[1])
-            return {"text": "🟢 Unfrozen\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"])}
+            return {"text": "🟢 Unfrozen\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"], chat_id)}
 
         if command == "/extend":
             if len(parts) != 3:
-                return {"text": "Usage: /extend <key> <days>", "reply_markup": telegram_admin_keyboard()}
+                return {"text": "Usage: /extend <key> <days>", "reply_markup": telegram_admin_keyboard(chat_id)}
             item = extend_license_record(parts[1], int(parts[2]))
-            return {"text": "➕ Extended\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"])}
+            return {"text": "➕ Extended\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"], chat_id)}
 
         if command == "/reset_hwid":
             if len(parts) != 2:
-                return {"text": "Usage: /reset_hwid <key>", "reply_markup": telegram_admin_keyboard()}
+                return {"text": "Usage: /reset_hwid <key>", "reply_markup": telegram_admin_keyboard(chat_id)}
             item = reset_hwid_record(parts[1])
-            return {"text": "♻️ HWID reset\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"])}
+            return {"text": "♻️ HWID reset\n\n" + format_license_details(item), "reply_markup": admin_key_actions_keyboard(item["license_key"], chat_id)}
 
         if command == "/delete":
             if len(parts) != 2:
-                return {"text": "Usage: /delete <key>", "reply_markup": telegram_admin_keyboard()}
+                return {"text": "Usage: /delete <key>", "reply_markup": telegram_admin_keyboard(chat_id)}
             delete_license_record(parts[1])
-            return {"text": f"🗑 Deleted {parts[1]}", "reply_markup": telegram_admin_keyboard()}
+            return {"text": f"🗑 Deleted {parts[1]}", "reply_markup": telegram_admin_keyboard(chat_id)}
     except ValueError as exc:
-        return {"text": f"⚠️ {exc}", "reply_markup": telegram_admin_keyboard()}
+        return {"text": f"⚠️ {exc}", "reply_markup": telegram_admin_keyboard(chat_id)}
     except Exception as exc:
-        return {"text": f"❌ Error: {exc}", "reply_markup": telegram_admin_keyboard()}
+        return {"text": f"❌ Error: {exc}", "reply_markup": telegram_admin_keyboard(chat_id)}
 
     return {"text": "❓ Неизвестная команда", "reply_markup": main_keyboard_for(chat_id)}
 
@@ -1066,18 +1570,21 @@ def telegram_poll_once() -> None:
         save_telegram_update_offset(update_id)
         reply = None
         chat_id = None
+        actor_id = None
 
         message = update.get("message") or {}
         if message:
             chat = message.get("chat") or {}
             chat_id = chat.get("id")
-            username = str(message.get("from", {}).get("username", "") or "")
-            first_name = str(message.get("from", {}).get("first_name", "") or "")
-            last_name = str(message.get("from", {}).get("last_name", "") or "")
+            from_user = message.get("from", {}) or {}
+            actor_id = from_user.get("id") or chat_id
+            username = str(from_user.get("username", "") or "")
+            first_name = str(from_user.get("first_name", "") or "")
+            last_name = str(from_user.get("last_name", "") or "")
             full_name = (first_name + " " + last_name).strip()
             text = str(message.get("text", "")).strip()
-            if chat_id and text:
-                reply = handle_telegram_command(int(chat_id), username, full_name, text)
+            if actor_id and text:
+                reply = handle_telegram_command(int(actor_id), username, full_name, text)
 
         callback_query = update.get("callback_query") or {}
         if callback_query:
@@ -1085,6 +1592,7 @@ def telegram_poll_once() -> None:
             message = callback_query.get("message") or {}
             chat_id = (message.get("chat") or {}).get("id")
             from_user = callback_query.get("from") or {}
+            actor_id = from_user.get("id") or chat_id
             username = str(from_user.get("username", "") or "")
             first_name = str(from_user.get("first_name", "") or "")
             last_name = str(from_user.get("last_name", "") or "")
@@ -1095,8 +1603,8 @@ def telegram_poll_once() -> None:
                     telegram_answer_callback(load_config(), callback_id)
                 except Exception as exc:
                     print(f"Telegram callback ack error: {exc}")
-            if chat_id and data:
-                reply = handle_telegram_callback(int(chat_id), username, full_name, data)
+            if actor_id and data:
+                reply = handle_telegram_callback(int(actor_id), username, full_name, data)
 
         if not chat_id or not reply:
             continue
@@ -2539,38 +3047,65 @@ def html_page(title: str, body: str) -> bytes:
 class LicenseHandler(BaseHTTPRequestHandler):
     server_version = "KeySystemTemplate/2.0"
 
-    def _send_bytes(self, code: int, body: bytes, content_type: str) -> None:
+    def _send_bytes(self, code: int, body: bytes, content_type: str,
+                    extra_headers: dict[str, str] | None = None,
+                    cookies_to_set: list[str] | None = None) -> None:
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "same-origin")
+        if extra_headers:
+            for key, value in extra_headers.items():
+                self.send_header(key, value)
+        if cookies_to_set:
+            for cookie_value in cookies_to_set:
+                self.send_header("Set-Cookie", cookie_value)
         self.end_headers()
         self.wfile.write(body)
 
     def _send_json(self, code: int, payload: dict) -> None:
-        self._send_bytes(code, json.dumps(payload).encode("utf-8"), "application/json; charset=utf-8")
+        self._send_bytes(code, json.dumps(payload, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
 
-    def _read_json(self) -> dict | None:
+    def _read_body(self, *, max_length: int = 64_000) -> bytes | None:
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            raw_body = self.rfile.read(length)
+        except Exception:
+            return None
+        if length <= 0 or length > max_length:
+            return None
+        return self.rfile.read(length)
+
+    def _read_json_body(self, raw_body: bytes) -> dict | None:
+        try:
             return json.loads(raw_body.decode("utf-8"))
         except Exception:
             return None
 
     def _read_form(self) -> dict[str, str]:
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length).decode("utf-8")
-        parsed = parse_qs(body, keep_blank_values=True)
+        raw_body = self._read_body(max_length=32_000)
+        if raw_body is None:
+            return {}
+        parsed = parse_qs(raw_body.decode("utf-8"), keep_blank_values=True)
         return {key: values[0] for key, values in parsed.items()}
 
-    def _get_session_token(self) -> str:
+    def _get_cookie_value(self, name: str) -> str:
         cookie_header = self.headers.get("Cookie", "")
         if not cookie_header:
             return ""
         jar = cookies.SimpleCookie()
         jar.load(cookie_header)
-        morsel = jar.get(SESSION_COOKIE)
+        morsel = jar.get(name)
         return morsel.value if morsel else ""
+
+    def _get_session_token(self) -> str:
+        return self._get_cookie_value(SESSION_COOKIE)
+
+    def _get_login_csrf_cookie(self) -> str:
+        return self._get_cookie_value(LOGIN_CSRF_COOKIE)
 
     def _client_ip(self) -> str:
         forwarded = self.headers.get("X-Forwarded-For", "")
@@ -2578,24 +3113,72 @@ class LicenseHandler(BaseHTTPRequestHandler):
             return forwarded.split(",")[0].strip()
         return self.client_address[0] if self.client_address else ""
 
+    def _request_host(self) -> str:
+        return str(self.headers.get("Host", "")).strip()
+
+    def _is_https_request(self) -> bool:
+        proto = str(self.headers.get("X-Forwarded-Proto", "")).strip().lower()
+        return proto == "https"
+
     def _client_agent_fingerprint(self) -> str:
         user_agent = self.headers.get("User-Agent", "").strip().lower()
         if not user_agent:
             return ""
         return hashlib.sha256(user_agent.encode("utf-8")).hexdigest()[:32]
 
+    def _same_origin_request(self) -> bool:
+        request_host = self._request_host()
+        if not request_host:
+            return True
+        for header_name in ("Origin", "Referer"):
+            header_value = str(self.headers.get(header_name, "")).strip()
+            if not header_value:
+                continue
+            parsed = urlparse(header_value)
+            if parsed.netloc and parsed.netloc.casefold() == request_host.casefold():
+                return True
+            hostname = parsed.hostname or ""
+            request_hostname = request_host.split(":", 1)[0]
+            return hostname.casefold() == request_hostname.casefold()
+        return True
+
+    def _build_cookie(self, name: str, value: str, *, path: str = "/", max_age: int | None = None,
+                      http_only: bool = True, same_site: str = "Strict") -> str:
+        parts = [f"{name}={value}", f"Path={path}", f"SameSite={same_site}"]
+        if http_only:
+            parts.append("HttpOnly")
+        if max_age is not None:
+            parts.append(f"Max-Age={max_age}")
+        if self._is_https_request():
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def _expire_cookie(self, name: str, *, path: str = "/") -> str:
+        return self._build_cookie(name, "deleted", path=path, max_age=0)
+
+    def _get_session_entry(self, db: dict, token: str) -> tuple[str, dict | None]:
+        sessions = db.setdefault("sessions", {})
+        if token in sessions:
+            session = sessions.get(token)
+            return token, session if isinstance(session, dict) else None
+        digest = session_token_digest(token)
+        session = sessions.get(digest)
+        return digest, session if isinstance(session, dict) else None
+
     def _admin_lock_matches(self, db: dict) -> bool:
         return True
 
     def _is_authenticated(self) -> bool:
+        self._current_session = None
+        self._current_session_key = ""
         token = self._get_session_token()
         if not token:
             return False
         db = load_db()
-        session = db.get("sessions", {}).get(token)
+        session_key, session = self._get_session_entry(db, token)
         if not session:
             return False
-        expires_at = session if isinstance(session, str) else session.get("expires_at", "")
+        expires_at = session.get("expires_at", "")
         if not expires_at:
             return False
         try:
@@ -2603,29 +3186,81 @@ class LicenseHandler(BaseHTTPRequestHandler):
                 return False
         except Exception:
             return False
+        current_fp = self._client_agent_fingerprint()
+        changed = False
+        if session.get("agent_fp") and current_fp and session.get("agent_fp") != current_fp:
+            log_security_event(
+                "admin_session_agent_mismatch",
+                source="web",
+                ip=self._client_ip(),
+                details="Session rejected because user-agent fingerprint changed",
+            )
+            db.setdefault("sessions", {}).pop(session_key, None)
+            save_db(db)
+            return False
+        if not session.get("agent_fp") and current_fp:
+            session["agent_fp"] = current_fp
+            changed = True
+        if not session.get("csrf_token"):
+            session["csrf_token"] = secrets.token_hex(16)
+            changed = True
+        if session.get("ip") and session.get("ip") != self._client_ip():
+            log_security_event(
+                "admin_session_ip_changed",
+                source="web",
+                ip=self._client_ip(),
+                level="info",
+                details="Admin session IP changed during active session",
+                extra={"previous_ip": session.get("ip", "")},
+            )
+        if changed:
+            db.setdefault("sessions", {})[session_key] = session
+            save_db(db)
+        self._current_session = session
+        self._current_session_key = session_key
         return self._admin_lock_matches(db)
 
     def _require_auth(self) -> bool:
         if self._is_authenticated():
             return True
-        self.send_response(302)
-        self.send_header("Location", "/admin/login")
-        self.end_headers()
+        self._redirect("/admin/login")
         return False
 
-    def _redirect(self, location: str, set_cookie: str | None = None) -> None:
+    def _require_admin_post(self, form: dict[str, str]) -> bool:
+        if not self._require_auth():
+            return False
+        if not self._same_origin_request():
+            log_security_event("admin_origin_rejected", source="web", ip=self._client_ip(), details="Origin/Referer mismatch")
+            self._redirect("/admin?flash=Security+check+failed")
+            return False
+        session = getattr(self, "_current_session", None) or {}
+        csrf_token = str(form.get("csrf_token", "")).strip()
+        session_csrf = str(session.get("csrf_token", "")).strip()
+        if not csrf_token or not session_csrf or not hmac.compare_digest(csrf_token, session_csrf):
+            log_security_event("admin_csrf_rejected", source="web", ip=self._client_ip(), details="CSRF token mismatch")
+            self._redirect("/admin?flash=Security+check+failed")
+            return False
+        return True
+
+    def _redirect(self, location: str, set_cookie: str | None = None, cookies_to_set: list[str] | None = None) -> None:
         self.send_response(302)
         self.send_header("Location", location)
         if set_cookie:
             self.send_header("Set-Cookie", set_cookie)
+        if cookies_to_set:
+            for cookie_value in cookies_to_set:
+                self.send_header("Set-Cookie", cookie_value)
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
     def _render_login(self, error: str = "") -> None:
+        config = ensure_config()
         db = load_db()
         users_data = load_users()
         total_keys = len(db.get("licenses", []))
         linked_users = sum(1 for user in users_data.get("users", {}).values() if str(user.get("license_key", "")).strip())
         auth_logs = len(db.get("auth_logs", []))
+        login_csrf = secrets.token_hex(16)
         error_html = f'<div class="flash">{html.escape(error)}</div>' if error else ""
         body = f"""
 <div class="login-shell">
@@ -2644,6 +3279,7 @@ class LicenseHandler(BaseHTTPRequestHandler):
     </div>
     {error_html}
     <form method="post" action="/admin/login" class="form-grid">
+      {csrf_hidden_input(login_csrf)}
       <div>
         <label class="field-label" for="username">Username</label>
         <input id="username" name="username" placeholder="Enter your username" autocomplete="username" required>
@@ -2656,7 +3292,7 @@ class LicenseHandler(BaseHTTPRequestHandler):
     </form>
     <div class="login-meta">
       <span>Route: <strong>/admin</strong></span>
-      <span>Session time: <strong>12 hours</strong></span>
+      <span>Session time: <strong>{get_admin_session_hours(config)} hours</strong></span>
     </div>
   </section>
   <aside class="showcase-panel">
@@ -2693,10 +3329,17 @@ class LicenseHandler(BaseHTTPRequestHandler):
   </aside>
 </div>
 """
-        self._send_bytes(200, html_page("Key System Login", body), "text/html; charset=utf-8")
+        self._send_bytes(
+            200,
+            html_page("Key System Login", body),
+            "text/html; charset=utf-8",
+            cookies_to_set=[self._build_cookie(LOGIN_CSRF_COOKIE, login_csrf, path="/admin", max_age=600)],
+        )
 
     def _render_admin(self, query: str = "", flash: str = "") -> None:
         db = load_db()
+        session = getattr(self, "_current_session", {}) or {}
+        csrf_token = str(session.get("csrf_token", "")).strip()
         all_items = db.get("licenses", [])
         search = query.strip().lower()
         items = list(all_items)
@@ -2735,7 +3378,7 @@ class LicenseHandler(BaseHTTPRequestHandler):
         log_count = len(db.get("auth_logs", []))
         total_count = len(all_items)
         showing_count = len(items)
-        cards_html = "".join(render_license_card_html(item) for item in items)
+        cards_html = "".join(render_license_card_html(item, csrf_token) for item in items)
         if not cards_html:
             cards_html = '<div class="empty-state">No keys matched the current search. Try another query or create a new license from the forms above.</div>'
 
@@ -2792,6 +3435,7 @@ class LicenseHandler(BaseHTTPRequestHandler):
           <button class="btn primary" type="submit">Search</button>
         </form>
         <form method="post" action="/admin/logout">
+          {csrf_hidden_input(csrf_token)}
           <button class="btn alt" type="submit">Logout</button>
         </form>
       </div>
@@ -2850,6 +3494,7 @@ class LicenseHandler(BaseHTTPRequestHandler):
           <p>Add a brand new license with its own owner name, product and notes.</p>
         </div>
         <form method="post" action="/admin/create" class="form-grid">
+          {csrf_hidden_input(csrf_token)}
           <div class="form-pair">
             <div>
               <label class="field-label" for="create-key">License key</label>
@@ -2884,6 +3529,7 @@ class LicenseHandler(BaseHTTPRequestHandler):
           <p>Extend an existing key without touching the rest of the record.</p>
         </div>
         <form method="post" action="/admin/action" class="form-grid">
+          {csrf_hidden_input(csrf_token)}
           <input type="hidden" name="action" value="extend">
           <div>
             <label class="field-label" for="extend-key">License key</label>
@@ -2903,6 +3549,7 @@ class LicenseHandler(BaseHTTPRequestHandler):
           <p>Rename a key owner, change product, adjust notes or add days in one place.</p>
         </div>
         <form method="post" action="/admin/action" class="form-grid">
+          {csrf_hidden_input(csrf_token)}
           <input type="hidden" name="action" value="edit">
           <div>
             <label class="field-label" for="edit-key">License key</label>
@@ -2968,6 +3615,42 @@ class LicenseHandler(BaseHTTPRequestHandler):
             return '<div class="empty-state">No validation attempts yet. After users start checking licenses, recent activity will appear here.</div>'
         return '<div class="log-list">' + "".join(render_auth_log_card_html(log) for log in logs) + '</div>'
 
+    def _validate_api_request(self, raw_body: bytes) -> tuple[bool, str]:
+        config = ensure_config()
+        signature = str(self.headers.get(API_SIGNATURE_HEADER, "")).strip().lower()
+        timestamp_value = str(self.headers.get(API_TIMESTAMP_HEADER, "")).strip()
+        nonce = str(self.headers.get(API_NONCE_HEADER, "")).strip()
+        ip = self._client_ip()
+        if not signature or not timestamp_value or not nonce:
+            log_security_event("api_signature_missing", source="api", ip=ip, details="Missing API signature headers")
+            return False, "Missing API security headers"
+        try:
+            timestamp_int = int(timestamp_value)
+        except ValueError:
+            log_security_event("api_signature_bad_timestamp", source="api", ip=ip, details="Invalid API timestamp header")
+            return False, "Invalid API timestamp"
+        ttl_seconds = get_api_signature_ttl_seconds(config)
+        if abs(int(time.time()) - timestamp_int) > ttl_seconds:
+            log_security_event("api_signature_expired", source="api", ip=ip, details="Expired API signature timestamp")
+            return False, "Expired API signature"
+        if len(nonce) < 8 or len(nonce) > 64:
+            log_security_event("api_signature_bad_nonce", source="api", ip=ip, details="Invalid API nonce length")
+            return False, "Invalid API nonce"
+
+        expected = compute_api_signature(get_api_shared_secret(config), timestamp_value, nonce, raw_body)
+        if not hmac.compare_digest(signature, expected):
+            log_security_event("api_signature_mismatch", source="api", ip=ip, details="API signature mismatch")
+            return False, "Invalid API signature"
+
+        db = load_db()
+        prune_api_nonces(db, ttl_seconds)
+        if nonce in db.setdefault("api_nonces", {}):
+            log_security_event("api_signature_replay", source="api", ip=ip, details="Replay nonce rejected")
+            return False, "Replay request rejected"
+        register_api_nonce(db, nonce)
+        save_db(db)
+        return True, ""
+
     def log_message(self, format: str, *args) -> None:
         return
 
@@ -2979,6 +3662,9 @@ class LicenseHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/admin/login":
+            if self._is_authenticated():
+                self._redirect("/admin")
+                return
             self._render_login()
             return
 
@@ -2993,15 +3679,28 @@ class LicenseHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         if self.path == "/api/validate":
-            data = self._read_json()
+            raw_body = self._read_body()
+            if raw_body is None:
+                self._send_json(400, {"success": False, "message": "Invalid request body"})
+                return
+            data = self._read_json_body(raw_body)
             if not data:
+                log_security_event("api_bad_json", source="api", ip=self._client_ip(), details="Invalid JSON payload")
                 self._send_json(400, {"success": False, "message": "Invalid JSON"})
+                return
+            if str(self.headers.get("Content-Type", "")).split(";", 1)[0].strip().lower() != "application/json":
+                log_security_event("api_bad_content_type", source="api", ip=self._client_ip(), details="Invalid content type")
+                self._send_json(400, {"success": False, "message": "Content-Type must be application/json"})
+                return
+            api_ok, api_error = self._validate_api_request(raw_body)
+            if not api_ok:
+                self._send_json(403, {"success": False, "message": api_error})
                 return
 
             license_key = str(data.get("license_key", "")).strip()
             hwid = str(data.get("hwid", "")).strip()
             product = str(data.get("product", "")).strip()
-            ip = self.client_address[0] if self.client_address else ""
+            ip = self._client_ip()
             if not license_key or not hwid or not product:
                 self._send_json(400, {"success": False, "message": "Missing required fields"})
                 return
@@ -3013,35 +3712,67 @@ class LicenseHandler(BaseHTTPRequestHandler):
         if self.path == "/admin/login":
             form = self._read_form()
             config = ensure_config()
-            if form.get("username") != config.get("admin_username") or form.get("password") != config.get("admin_password"):
+            ip = self._client_ip()
+            if not self._same_origin_request():
+                log_security_event("admin_login_origin_rejected", source="web", ip=ip, details="Login request failed origin check")
+                self._render_login("Security check failed")
+                return
+            submitted_login_csrf = str(form.get("csrf_token", "")).strip()
+            login_cookie_csrf = self._get_login_csrf_cookie()
+            if not submitted_login_csrf or not login_cookie_csrf or not hmac.compare_digest(submitted_login_csrf, login_cookie_csrf):
+                log_security_event("admin_login_csrf_rejected", source="web", ip=ip, details="Login CSRF token mismatch")
+                self._render_login("Security check failed")
+                return
+            if is_login_rate_limited(ip):
+                log_security_event("admin_login_rate_limited", source="web", ip=ip, details="Too many login attempts")
+                self._render_login("Too many attempts. Try again later.")
+                return
+            if form.get("username") != config.get("admin_username") or not verify_admin_password(config, str(form.get("password", ""))):
+                record_login_failure(ip)
+                log_security_event("admin_login_failed", source="web", ip=ip, details="Invalid admin credentials")
                 self._render_login("Invalid credentials")
                 return
 
+            clear_login_failures(ip)
             db = load_db()
             db["admin_device_lock"] = {}
             token = secrets.token_hex(24)
-            db.setdefault("sessions", {})[token] = {
-                "expires_at": iso_utc(now_utc() + timedelta(hours=12)),
-                "ip": self._client_ip(),
-                "agent_fp": "",
+            session_key = session_token_digest(token)
+            db.setdefault("sessions", {})[session_key] = {
+                "created_at": iso_utc(now_utc()),
+                "expires_at": iso_utc(now_utc() + timedelta(hours=get_admin_session_hours(config))),
+                "ip": ip,
+                "agent_fp": self._client_agent_fingerprint(),
+                "csrf_token": secrets.token_hex(16),
             }
             save_db(db)
-            self._redirect("/admin", f"{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax")
+            self._redirect(
+                "/admin",
+                cookies_to_set=[
+                    self._build_cookie(SESSION_COOKIE, token, max_age=get_admin_session_hours(config) * 3600),
+                    self._expire_cookie(LOGIN_CSRF_COOKIE, path="/admin"),
+                ],
+            )
             return
 
         if self.path == "/admin/logout":
+            form = self._read_form()
+            if not self._require_admin_post(form):
+                return
             db = load_db()
             token = self._get_session_token()
             if token:
-                db.get("sessions", {}).pop(token, None)
+                session_key, _ = self._get_session_entry(db, token)
+                if session_key:
+                    db.get("sessions", {}).pop(session_key, None)
                 save_db(db)
-            self._redirect("/admin/login", f"{SESSION_COOKIE}=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+            self._redirect("/admin/login", cookies_to_set=[self._expire_cookie(SESSION_COOKIE)])
             return
 
         if self.path == "/admin/create":
-            if not self._require_auth():
-                return
             form = self._read_form()
+            if not self._require_admin_post(form):
+                return
             key = form.get("license_key", "").strip()
             name = form.get("name", "").strip()
             product = form.get("product", "").strip()
@@ -3052,63 +3783,45 @@ class LicenseHandler(BaseHTTPRequestHandler):
                 self._redirect("/admin?flash=Invalid+days")
                 return
 
-            db = load_db()
             if not key or not name or not product:
                 self._redirect("/admin?flash=Missing+required+fields")
                 return
-            if find_license(db, key):
+            try:
+                create_license_record(key, name, days, product, notes)
+            except ValueError:
                 self._redirect("/admin?flash=License+already+exists")
                 return
-
-            item = {
-                "license_key": key,
-                "name": name,
-                "product": product,
-                "expires_at": iso_utc(now_utc() + timedelta(days=days)),
-                "status": "active",
-                "hwid": "",
-                "notes": notes,
-                "created_at": iso_utc(now_utc()),
-                "last_seen_at": "",
-                "max_users": 1,
-            }
-            db.setdefault("licenses", []).append(item)
-            save_db(db)
             self._redirect("/admin?flash=Key+created")
             return
 
         if self.path == "/admin/action":
-            if not self._require_auth():
-                return
             form = self._read_form()
+            if not self._require_admin_post(form):
+                return
             action = form.get("action", "").strip()
             key = form.get("key", "").strip()
-            db = load_db()
-            item = find_license(db, key)
-            if not item:
+            try:
+                item = show_license_record(key)
+            except ValueError:
+                log_security_event("admin_action_missing_key", source="web", ip=self._client_ip(), details="Admin action requested missing key", extra={"action": action, "key": key})
                 self._redirect("/admin?flash=License+not+found")
                 return
 
             if action == "freeze":
-                item["status"] = "frozen"
-                save_db(db)
+                freeze_license_record(key)
                 self._redirect("/admin?flash=Key+frozen")
                 return
 
             if action == "unfreeze":
                 if now_utc() > parse_iso_utc(item["expires_at"]):
-                    item["status"] = "expired"
-                    save_db(db)
                     self._redirect("/admin?flash=Key+already+expired")
                     return
-                item["status"] = "active"
-                save_db(db)
+                unfreeze_license_record(key)
                 self._redirect("/admin?flash=Key+unfrozen")
                 return
 
             if action == "reset_hwid":
-                item["hwid"] = ""
-                save_db(db)
+                reset_hwid_record(key)
                 self._redirect("/admin?flash=HWID+reset")
                 return
 
@@ -3118,12 +3831,7 @@ class LicenseHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     self._redirect("/admin?flash=Invalid+days")
                     return
-                base = parse_iso_utc(item["expires_at"])
-                if now_utc() > base:
-                    base = now_utc()
-                item["expires_at"] = iso_utc(base + timedelta(days=days))
-                item["status"] = "active"
-                save_db(db)
+                extend_license_record(key, days)
                 self._redirect("/admin?flash=Key+extended")
                 return
 
@@ -3133,33 +3841,29 @@ class LicenseHandler(BaseHTTPRequestHandler):
                 new_notes = form.get("notes", "").strip()
                 days_raw = form.get("days", "0").strip()
 
-                if new_name:
-                    item["name"] = new_name
-                if new_product:
-                    item["product"] = new_product
-                item["notes"] = new_notes
-
                 try:
                     days = int(days_raw)
                 except ValueError:
                     self._redirect("/admin?flash=Invalid+days")
                     return
 
+                update_license_record(
+                    key,
+                    name=new_name if new_name else None,
+                    product=new_product if new_product else None,
+                    notes=new_notes,
+                )
                 if days > 0:
-                    item["expires_at"] = iso_utc(now_utc() + timedelta(days=days))
-                    if item.get("status") == "expired":
-                        item["status"] = "active"
-
-                save_db(db)
+                    set_license_days_left(key, days)
                 self._redirect("/admin?flash=Key+updated")
                 return
 
             if action == "delete":
-                db["licenses"] = [license_item for license_item in db.get("licenses", []) if license_item.get("license_key") != key]
-                save_db(db)
+                delete_license_record(key)
                 self._redirect("/admin?flash=Key+deleted")
                 return
 
+            log_security_event("admin_action_unknown", source="web", ip=self._client_ip(), details="Unknown admin action", extra={"action": action})
             self._redirect("/admin?flash=Unknown+action")
             return
 
@@ -3167,25 +3871,27 @@ class LicenseHandler(BaseHTTPRequestHandler):
 
 
 def command_serve(args: argparse.Namespace) -> None:
+    ensure_storage_layout()
     ensure_config()
     if args.with_telegram:
         threading.Thread(target=run_telegram_bot_forever, daemon=True).start()
     server = ThreadingHTTPServer((args.host, args.port), LicenseHandler)
     print(f"Serving on http://{args.host}:{args.port}")
     print("Admin panel: /admin")
+    print(f"Data directory: {DATA_DIR}")
     server.serve_forever()
 
 
 def command_create(args: argparse.Namespace) -> None:
     try:
-        print(json.dumps(create_license_record(args.key, args.name, args.days, args.product, args.notes), indent=2))
+        print(json.dumps(create_license_record(args.key, args.name, args.days, args.product, args.notes), indent=2, ensure_ascii=False))
     except ValueError as exc:
         raise SystemExit(str(exc))
 
 
 def command_list(_: argparse.Namespace) -> None:
     db = load_db()
-    print(json.dumps(db.get("licenses", []), indent=2))
+    print(json.dumps(db.get("licenses", []), indent=2, ensure_ascii=False))
 
 
 def command_freeze(args: argparse.Namespace) -> None:
@@ -3206,7 +3912,7 @@ def command_unfreeze(args: argparse.Namespace) -> None:
 
 def command_extend(args: argparse.Namespace) -> None:
     try:
-        print(json.dumps(extend_license_record(args.key, args.days), indent=2))
+        print(json.dumps(extend_license_record(args.key, args.days), indent=2, ensure_ascii=False))
     except ValueError as exc:
         raise SystemExit(str(exc))
 
@@ -3221,7 +3927,7 @@ def command_reset_hwid(args: argparse.Namespace) -> None:
 
 def command_show(args: argparse.Namespace) -> None:
     try:
-        print(json.dumps(show_license_record(args.key), indent=2))
+        print(json.dumps(show_license_record(args.key), indent=2, ensure_ascii=False))
     except ValueError as exc:
         raise SystemExit(str(exc))
 
@@ -3235,9 +3941,10 @@ def command_delete(args: argparse.Namespace) -> None:
 
 
 def command_set_admin(args: argparse.Namespace) -> None:
-    config = load_config()
+    config = ensure_config()
     config["admin_username"] = args.username
-    config["admin_password"] = args.password
+    config["admin_password"] = ""
+    config["admin_password_hash"] = hash_password_value(args.password)
     save_config(config)
     print("Admin credentials updated")
 
@@ -3250,8 +3957,13 @@ def command_set_telegram(args: argparse.Namespace) -> None:
 
 
 def command_bot(_: argparse.Namespace) -> None:
+    ensure_storage_layout()
     ensure_config()
     run_telegram_bot_forever()
+
+
+def command_apply_key_rules(_: argparse.Namespace) -> None:
+    print(json.dumps(apply_requested_key_updates(), indent=2, ensure_ascii=False))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3308,6 +4020,9 @@ def build_parser() -> argparse.ArgumentParser:
     set_telegram = sub.add_parser("set-telegram")
     set_telegram.add_argument("--token", required=True)
     set_telegram.set_defaults(func=command_set_telegram)
+
+    apply_key_rules = sub.add_parser("apply-key-rules")
+    apply_key_rules.set_defaults(func=command_apply_key_rules)
 
     bot = sub.add_parser("bot")
     bot.set_defaults(func=command_bot)

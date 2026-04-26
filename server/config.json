@@ -1,6 +1,6 @@
 {
   "admin_username": "Zetry",
-  "admin_password": "Gle603603",
+  "admin_password": "",
   "telegram_token": "8687292505:AAFrFJSt1RlMxDgXGVpElQ9M1AaxHVP-vUE",
   "telegram_admin_chat_ids": [
     1756633107
@@ -9,5 +9,9 @@
   "support_username": "blockedspam",
   "bot_info_text": "Key system bot",
   "user_sticker_id": "",
-  "admin_sticker_id": ""
+  "admin_sticker_id": "",
+  "admin_password_hash": "pbkdf2_sha256$240000$f5b5a9f04c63084527329c3bc7ebf011$b78194a2bdc5a5061d0a3d4dfe9f5ed11b3915708d976127cb9232ec07c19d70",
+  "api_shared_secret": "c1ed92191db24a669a2c88b2e918a719681ae8d77c21d7596854cbb2c11d0c31",
+  "api_signature_ttl_seconds": 300,
+  "admin_session_hours": 12
 }
