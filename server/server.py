@@ -720,7 +720,8 @@ def days_left_for_item(item: dict) -> int:
     expires_at = parse_iso_utc(item["expires_at"])
     if now_utc() > expires_at:
         return 0
-    return max(0, int((expires_at - now_utc()).total_seconds()) // 86400)
+    seconds_left = max(0, int((expires_at - now_utc()).total_seconds()))
+    return (seconds_left + 86399) // 86400
 
 
 def set_license_days_left(key: str, days: int) -> dict:

@@ -17,7 +17,7 @@ namespace {
 constexpr wchar_t kServerHost[] = L"127.0.0.1";
 constexpr int kServerPort = 8080;
 constexpr wchar_t kValidatePath[] = L"/api/validate";
-constexpr char kProductName[] = "loader";
+constexpr char kProductName[] = "Private cheat";
 constexpr char kApiSharedSecret[] = "c1ed92191db24a669a2c88b2e918a719681ae8d77c21d7596854cbb2c11d0c31";
 
 std::string WideToUtf8(const std::wstring& value) {
